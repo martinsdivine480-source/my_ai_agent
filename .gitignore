@@ -1,0 +1,16 @@
+# secrets
+.env
+
+# virtual environment
+venv/
+
+# the agent's personal data
+memory.json
+memory.corrupt.json
+tasks.json
+tasks.corrupt.json
+workspace/
+
+# Python junk
+__pycache__/
+*.pyc
