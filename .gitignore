@@ -14,3 +14,4 @@ workspace/
 # Python junk
 __pycache__/
 *.pyc
+chats/

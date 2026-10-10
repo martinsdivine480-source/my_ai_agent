@@ -14,12 +14,22 @@ load_dotenv()
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-# Web search only runs when you start a message with /web (and only if this is true).
+# Web search only runs when you ask for it (/web in the terminal, the checkbox in the browser).
 ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").strip().lower() == "true"
 MAX_STEPS = 12  # safety limit: stops a runaway tool-calling loop
 REQUEST_TIMEOUT_SECONDS = 45  # stop waiting for a model call after this long
 
 SEARCH_TOOL = {"type": "google_search"}
+
+# The terminal prints status lines and asks for approval with input().
+# server.py replaces these two handlers so the browser can show them instead.
+LOG_HANDLER = print
+CONFIRM_HANDLER = None
+
+
+def log(message: str) -> None:
+    LOG_HANDLER(message)
+
 
 BASE_INSTRUCTION = (
     "You are my personal task agent running on my Windows computer. "
@@ -56,7 +66,7 @@ BASE_INSTRUCTION = (
     "Be concise."
 )
 
-# Only added to the instructions on messages that start with /web.
+# Only added to the instructions when web search is requested.
 WEB_INSTRUCTION = (
     "Web search is available for this request through Google Search. Use it for current or "
     "outside information, and name the main sources you used in your answer."
@@ -121,7 +131,7 @@ def load_list(path: Path) -> list:
         # Keep the damaged file instead of silently overwriting it.
         backup = path.with_name(path.stem + ".corrupt.json")
         path.replace(backup)
-        print(f"  [warning] {path.name} was damaged; saved as {backup.name}")
+        log(f"  [warning] {path.name} was damaged; saved as {backup.name}")
         return []
 
 
@@ -292,7 +302,7 @@ def run_python(path: str) -> dict:
     seconds = round(time.time() - start, 1)
     truncated = len(stdout) > MAX_OUTPUT_CHARS or len(stderr) > MAX_OUTPUT_CHARS
     note = " (timed out)" if timed_out else ""
-    print(f"  [ran] {path}: exit code {exit_code}{note} in {seconds}s")
+    log(f"  [ran] {path}: exit code {exit_code}{note} in {seconds}s")
     return {
         "path": path,
         "exit_code": exit_code,
@@ -325,14 +335,14 @@ def remember(fact: str) -> dict:
     new_id = max((m["id"] for m in memories), default=0) + 1
     memories.append({"id": new_id, "fact": fact, "saved": datetime.now().date().isoformat()})
     save_memories(memories)
-    print(f"  [memory saved] #{new_id}: {fact}")
+    log(f"  [memory saved] #{new_id}: {fact}")
     return {"status": "saved", "id": new_id}
 
 
 def forget(memory_id: int) -> dict:
     memory_id = int(memory_id)
     if delete_memory(memory_id):
-        print(f"  [memory deleted] #{memory_id}")
+        log(f"  [memory deleted] #{memory_id}")
         return {"status": "deleted", "id": memory_id}
     return {"error": f"No saved note with id {memory_id}."}
 
@@ -379,7 +389,7 @@ def add_task(title: str, due_date: str | None = None) -> dict:
     )
     save_list(TASKS_FILE, tasks)
     due_text = f" (due {due})" if due else ""
-    print(f"  [task added] #{new_id}: {title}{due_text}")
+    log(f"  [task added] #{new_id}: {title}{due_text}")
     return {"status": "added", "id": new_id, "title": title, "due": due}
 
 
@@ -414,7 +424,7 @@ def complete_task(task_id: int) -> dict:
             t["status"] = "done"
             t["completed"] = date.today().isoformat()
             save_list(TASKS_FILE, tasks)
-            print(f"  [task completed] #{task_id}: {t['title']}")
+            log(f"  [task completed] #{task_id}: {t['title']}")
             return {"status": "completed", "id": task_id, "title": t["title"]}
     return {"error": f"No task with id {task_id}."}
 
@@ -426,7 +436,7 @@ def delete_task(task_id: int) -> dict:
     if len(remaining) == len(tasks):
         return {"error": f"No task with id {task_id}."}
     save_list(TASKS_FILE, remaining)
-    print(f"  [task deleted] #{task_id}")
+    log(f"  [task deleted] #{task_id}")
     return {"status": "deleted", "id": task_id}
 
 
@@ -623,36 +633,37 @@ TOOL_FUNCTIONS = {
 # ---------------------------------------------------------------
 # CONFIRMATION GATE
 # ---------------------------------------------------------------
-def confirm_action(name: str, args: dict) -> bool:
-    """Show exactly what the agent wants to do and ask for approval."""
-    print(f"\n  >>> The agent wants to run: {name}")
+def describe_action(name: str, args: dict) -> str:
+    """Plain-text description of what a tool is about to do, shown before you approve.
+    Raises ValueError if the request is not allowed, so you are never asked about it."""
+    lines = [f"The agent wants to run: {name}"]
 
     if name == "write_file":
         path = args.get("path", "")
         content = args.get("content", "")
-        target = _validate_write(path, content)  # raises before asking if not allowed
+        target = _validate_write(path, content)
         action = "OVERWRITE existing file" if target.exists() else "CREATE new file"
-        print(f"  >>> {action}: {path}")
-        print("  >>> Content preview:")
-        print("  | " + content[:PREVIEW_CHARS].replace("\n", "\n  | "))
+        lines.append(f"{action}: {path}")
+        lines.append("Content preview:")
+        lines += ["| " + line for line in content[:PREVIEW_CHARS].split("\n")]
         if len(content) > PREVIEW_CHARS:
-            print(f"  | ... ({len(content) - PREVIEW_CHARS} more characters not shown)")
+            lines.append(f"... ({len(content) - PREVIEW_CHARS} more characters not shown)")
 
     elif name == "run_python":
         path = args.get("path", "")
-        _, code = _prepare_run(path)  # raises before asking if not allowed
-        print(f"  >>> RUN Python file: {path}")
-        print(f"  >>> Limits: {RUN_TIMEOUT_SECONDS}s time limit, output capped, no keyboard input.")
-        print("  >>> WARNING: this is NOT a sandbox. It runs with your Windows user's permissions.")
-        print("  >>> Read the full code below before approving:")
-        print("  | " + code.replace("\n", "\n  | "))
+        _, code = _prepare_run(path)
+        lines.append(f"RUN Python file: {path}")
+        lines.append(f"Limits: {RUN_TIMEOUT_SECONDS}s time limit, output capped, no keyboard input.")
+        lines.append("WARNING: this is NOT a sandbox. It runs with your Windows user's permissions.")
+        lines.append("Read the full code below before approving:")
+        lines += ["| " + line for line in code.split("\n")]
 
     elif name == "forget":
         memory_id = int(args.get("memory_id"))
         match = next((m for m in load_memories() if m["id"] == memory_id), None)
         if match is None:
             raise ValueError(f"No saved note with id {memory_id}.")
-        print(f"  >>> DELETE saved note #{match['id']}: {match['fact']}")
+        lines.append(f"DELETE saved note #{match['id']}: {match['fact']}")
 
     elif name == "delete_task":
         task_id = int(args.get("task_id"))
@@ -660,8 +671,20 @@ def confirm_action(name: str, args: dict) -> bool:
         if match is None:
             raise ValueError(f"No task with id {task_id}.")
         due = f" (due {match['due']})" if match.get("due") else ""
-        print(f"  >>> DELETE task #{match['id']}: {match['title']}{due}")
+        lines.append(f"DELETE task #{match['id']}: {match['title']}{due}")
 
+    return "\n".join(lines)
+
+
+def confirm_action(name: str, args: dict) -> bool:
+    """Ask for approval: in the browser if server.py is running, otherwise in the terminal."""
+    if CONFIRM_HANDLER is not None:
+        return CONFIRM_HANDLER(name, args)
+
+    text = describe_action(name, args)
+    print()
+    for line in text.split("\n"):
+        print(("  " if line.startswith("|") else "  >>> ") + line)
     answer = input("  Allow this? (y/n): ").strip().lower()
     return answer == "y"
 
@@ -723,17 +746,22 @@ def call_model(model_input, previous_id: str | None = None, use_search: bool = F
 
     for attempt in (1, 2):
         start = time.time()
-        print("  [waiting for model...]")
+        log("  [waiting for model...]")
         try:
             result = run_with_timeout(client.interactions.create, REQUEST_TIMEOUT_SECONDS, **kwargs)
-            print(f"  [model replied in {time.time() - start:.1f}s]")
+            log(f"  [model replied in {time.time() - start:.1f}s]")
             return result
         except Exception as e:
-            print(f"  [model call failed after {time.time() - start:.1f}s]")
+            log(f"  [model call failed after {time.time() - start:.1f}s]")
             if attempt == 1 and is_transient(e):
-                print("  [connection dropped, retrying once...]")
+                log("  [connection dropped, retrying once...]")
                 continue
             raise
+
+
+def _short(args) -> str:
+    text = json.dumps(args, ensure_ascii=False, default=str)
+    return text if len(text) <= 160 else text[:160] + "..."
 
 
 def ask(user_text: str, previous_id: str | None = None, use_search: bool = False):
@@ -742,7 +770,7 @@ def ask(user_text: str, previous_id: str | None = None, use_search: bool = False
 
     for _ in range(MAX_STEPS):
         if use_search and any("search" in str(s.type) for s in interaction.steps):
-            print("  [web search used]")
+            log("  [web search used]")
 
         calls = [s for s in interaction.steps if s.type == "function_call"]
         if not calls:
@@ -750,7 +778,7 @@ def ask(user_text: str, previous_id: str | None = None, use_search: bool = False
 
         results = []
         for call in calls:
-            print(f"  [tool] {call.name}({call.arguments})")
+            log(f"  [tool] {call.name} {_short(call.arguments)}")
             result = run_tool(call.name, call.arguments)
             results.append(
                 {
@@ -767,7 +795,8 @@ def ask(user_text: str, previous_id: str | None = None, use_search: bool = False
 
 
 # ---------------------------------------------------------------
-# YOUR OWN COMMANDS AND STARTUP BRIEFING (these never go to the model)
+# TERMINAL MODE: your own commands and startup briefing
+# (run with:  python agent.py   -- the browser version is:  python server.py)
 # ---------------------------------------------------------------
 def show_memories() -> None:
     memories = load_memories()
