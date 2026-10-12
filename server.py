@@ -189,9 +189,9 @@ def web_confirm(name: str, args: dict) -> bool:
     return decision
 
 
-def run_request(model_text: str, use_search: bool) -> None:
+def run_request(model_text: str, message: str, use_search: bool) -> None:
     try:
-        interaction = agent.ask(model_text, state.previous_id, use_search)
+        interaction = agent.ask(model_text, state.previous_id, use_search, user_message=message)
         state.previous_id = interaction.id
         state.resume_context = None  # the old chat has now been shown to the model
         push("answer", text=interaction.output_text or "(The model returned no text.)")
@@ -263,6 +263,38 @@ def get_state():
     }
 
 
+class TaskIn(BaseModel):
+    title: str
+    due_date: str | None = None
+
+
+@app.post("/api/tasks")
+def add_task_button(body: TaskIn):
+    try:
+        result = agent.create_task(body.title, body.due_date or None)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+@app.post("/api/tasks/{task_id}/complete")
+def complete_task_button(task_id: int):
+    result = agent.finish_task(task_id)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=404)
+    return result
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task_button(task_id: int):
+    result = agent.remove_task(task_id)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=404)
+    return result
+
+
 @app.get("/api/events")
 def get_events(after: int = 0):
     with state.lock:
@@ -292,7 +324,7 @@ def chat(body: ChatIn):
     push("user", text=message)
     save_current_chat()
     model_text = f"{context}\n\nNew message from the user:\n{message}" if context else message
-    threading.Thread(target=run_request, args=(model_text, use_search), daemon=True).start()
+    threading.Thread(target=run_request, args=(model_text, message, use_search), daemon=True).start()
     return {"ok": True}
 
 
@@ -416,6 +448,13 @@ INDEX_HTML = r"""<!doctype html>
   aside h3, nav h3 { margin:4px 0 8px; font-size:14px; }
   .item { font-size:13px; padding:6px 0; border-bottom:1px solid #eef0f4; }
   .overdue { color:var(--bad); font-weight:600; }
+  .addtask { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
+  .addtask input { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:8px; font:inherit; font-size:13px; }
+  .addtask .row input { flex:1; min-width:0; width:auto; }
+  .taskrow { display:flex; align-items:flex-start; gap:2px; }
+  .tasklabel { flex:1; min-width:0; word-wrap:break-word; padding-top:2px; }
+  .tick { color:#2e8b57; }
+  .tick:hover { color:#1f6b42; }
   .chatitem { display:flex; align-items:center; gap:4px; padding:6px 6px; border-radius:8px; cursor:pointer; }
   .chatitem:hover { background:#f0f2f7; }
   .chatitem.current { background:var(--user); }
@@ -455,7 +494,12 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
   <aside>
-    <h3>Open tasks</h3><div id="tasks" class="muted">loading...</div>
+    <h3>Open tasks</h3>
+    <div class="addtask">
+      <input id="taskTitle" type="text" maxlength="200" placeholder="New task...">
+      <div class="row"><input id="taskDue" type="date" title="Due date (optional)"><button id="taskAdd" class="primary">Add</button></div>
+    </div>
+    <div id="tasks" class="muted">loading...</div>
     <h3>Saved notes</h3><div id="notes" class="muted">loading...</div>
   </aside>
 </main>
@@ -654,10 +698,27 @@ async function loadState() {
     tasks.innerHTML = "";
     if (!s.tasks.length) tasks.textContent = "No open tasks.";
     s.tasks.forEach(function (t) {
-      const d = document.createElement("div");
-      d.className = "item" + (t.overdue ? " overdue" : "");
-      d.textContent = "[" + t.id + "] " + t.title + (t.due ? " - due " + t.due : "") + (t.overdue ? " (OVERDUE)" : "");
-      tasks.appendChild(d);
+      const row = document.createElement("div");
+      row.className = "item taskrow" + (t.overdue ? " overdue" : "");
+      const tick = document.createElement("button");
+      tick.className = "iconbtn tick";
+      tick.title = "Mark as done";
+      tick.textContent = "\u2713";
+      tick.onclick = function () { taskAction("/api/tasks/" + t.id + "/complete", "POST"); };
+      const label = document.createElement("div");
+      label.className = "tasklabel";
+      label.textContent = t.title + (t.due ? " (due " + t.due + ")" : "") + (t.overdue ? " - OVERDUE" : "");
+      const del = document.createElement("button");
+      del.className = "iconbtn";
+      del.title = "Delete this task";
+      del.textContent = "\u00d7";
+      del.onclick = function () {
+        if (confirm("Delete this task?\n\n" + t.title)) taskAction("/api/tasks/" + t.id, "DELETE");
+      };
+      row.appendChild(tick);
+      row.appendChild(label);
+      row.appendChild(del);
+      tasks.appendChild(row);
     });
     const notes = document.getElementById("notes");
     notes.innerHTML = "";
@@ -718,6 +779,35 @@ document.getElementById("newchat").onclick = async function () {
     showNotice(e.message);
   }
 };
+
+async function taskAction(path, method) {
+  try {
+    await api(path, { method: method, body: method === "POST" ? "{}" : undefined });
+    loadState();
+  } catch (e) {
+    showNotice(e.message);
+  }
+}
+
+async function addTask() {
+  const titleBox = document.getElementById("taskTitle");
+  const dueBox = document.getElementById("taskDue");
+  const title = titleBox.value.trim();
+  if (!title) return;
+  try {
+    await api("/api/tasks", { method: "POST", body: JSON.stringify({ title: title, due_date: dueBox.value || null }) });
+    titleBox.value = "";
+    dueBox.value = "";
+    loadState();
+  } catch (e) {
+    showNotice("Could not add the task: " + e.message);
+  }
+}
+
+document.getElementById("taskAdd").onclick = addTask;
+document.getElementById("taskTitle").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") { e.preventDefault(); addTask(); }
+});
 
 loadState();
 loadChats();
