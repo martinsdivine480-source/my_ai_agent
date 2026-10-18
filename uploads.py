@@ -15,8 +15,8 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024            # one file
 MAX_FOLDER_BYTES = 200 * 1024 * 1024           # everything in workspace/uploads
 MAX_FILES_PER_MESSAGE = 5
 MAX_MEDIA_BYTES_PER_MESSAGE = 25 * 1024 * 1024  # PDFs and images sent to the model at once
-MAX_INLINE_CHARS_PER_FILE = 20000              # file text placed directly in your message
-MAX_INLINE_CHARS_TOTAL = 40000
+MAX_INLINE_CHARS_PER_FILE = 120000             # file text placed directly in your message
+MAX_INLINE_CHARS_TOTAL = 240000                # about 60,000 tokens at most
 MAX_EXTRACTED_CHARS = 1_000_000                # text extracted from an Office file
 MAX_ZIP_ENTRIES = 5000
 MAX_PART_BYTES = 20 * 1024 * 1024              # one XML part inside an Office file, unpacked
@@ -168,10 +168,27 @@ def _w_text(paragraph) -> str:
     return "".join(out)
 
 
+def _w_heading_level(paragraph) -> int:
+    """1-6 for Title / Heading 1..6 paragraphs, otherwise 0."""
+    properties = paragraph.find(W + "pPr")
+    style = properties.find(W + "pStyle") if properties is not None else None
+    if style is None:
+        return 0
+    value = (style.get(W + "val") or "").lower().replace(" ", "")
+    if value == "title":
+        return 1
+    match = re.fullmatch(r"heading(\d)", value)
+    return min(int(match.group(1)), 6) if match else 0
+
+
 def _docx_walk(parent, lines: list) -> None:
     for child in parent:
         if child.tag == W + "p":
-            lines.append(_w_text(child))
+            text = _w_text(child)
+            level = _w_heading_level(child)
+            if level and text.strip():
+                text = "#" * level + " " + text.strip()  # keeps chapters and headings visible
+            lines.append(text)
         elif child.tag == W + "tbl":
             for row in child.iter(W + "tr"):
                 cells = []
@@ -399,8 +416,10 @@ def build_model_input(user_text: str, records: list, workspace: Path) -> list:
         remaining -= len(shown)
         more = ""
         if len(text) > len(shown):
-            more = (f"\n[Only the first {len(shown)} of {len(text)} characters are shown. "
-                    f"Read more with read_file path='{readable}' start={len(shown)}.]")
+            more = (f"\n[Only the first {len(shown)} of {len(text)} characters are shown. To see the "
+                    f"rest, call read_file with path='{readable}' and start={len(shown)}, then keep "
+                    "going with next_start until the end. If the user wants a summary or analysis "
+                    "of the whole file, read all of it first.]")
         notes.append(f"- {record['name']} (text shown below; saved as {record['path']})")
         blocks.append({"type": "text",
                        "text": f"<<<FILE {boundary}: {record['name']}>>>\n{shown}{more}\n<<<END FILE {boundary}>>>"})
