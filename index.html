@@ -1,0 +1,1647 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My AI Agent</title>
+<style>
+  :root { --bg:#f5f6f8; --panel:#ffffff; --text:#1d2330; --muted:#6b7385; --line:#dfe3ea;
+          --accent:#2f5bea; --user:#e8eeff; --user-line:#cdd8ff; --bad:#c0352b;
+          --warn:#fff4d6; --warn-line:#ecd98a; --agent-bg:#ffffff; --btn-bg:#ffffff; --input-bg:#ffffff;
+          --err-bg:#fdecea; --err-line:#f3c3be; --pre-bg:#f1f3f7; --cardpre-bg:#fffdf5; --code-bg:#eef0f5;
+          --codehead-bg:#e9ecf3; --th-bg:#f1f3f7; --soft-line:#eef0f4; --hover:#f0f2f7; --greet:#c4cada;
+          --ok:#2e8b57; --okcard-bg:#eaf6ee; --okcard-line:#bfe3c9; --star:#d99a00; color-scheme: light; }
+  :root[data-theme="dark"] { --bg:#14171d; --panel:#1c2029; --text:#e6e9f0; --muted:#9aa3b5; --line:#2e3441;
+          --accent:#4f74f0; --user:#26324f; --user-line:#34457a; --bad:#ff7b72;
+          --warn:#3a3217; --warn-line:#6b5a1f; --agent-bg:#1c2029; --btn-bg:#232834; --input-bg:#12151b;
+          --err-bg:#3a1f1f; --err-line:#6b2f2f; --pre-bg:#12151b; --cardpre-bg:#2a2512; --code-bg:#2a3040;
+          --codehead-bg:#262c38; --th-bg:#262c38; --soft-line:#262b36; --hover:#252b37; --greet:#4a5266;
+          --ok:#58c98a; --okcard-bg:#16301f; --okcard-line:#2c5a3b; --star:#f0b429; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; font-family: system-ui, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text);
+         height:100vh; display:flex; flex-direction:column; overflow-x:hidden; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:10px 16px;
+           background:var(--panel); border-bottom:1px solid var(--line); gap:12px; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:13px; }
+  .row { display:flex; gap:10px; align-items:center; }
+  select, .sel { padding:5px 8px; border:1px solid var(--line); border-radius:8px; background:var(--btn-bg);
+                 color:var(--text); font:inherit; font-size:13px; cursor:pointer; }
+  #modelsel { max-width:210px; }
+  main { flex:1; display:grid; grid-template-columns: 230px minmax(0, 1fr) 290px; grid-template-rows: minmax(0, 1fr);
+         gap:12px; padding:12px; min-height:0; min-width:0; }
+  #chatcol { display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line);
+             border-radius:10px; min-height:0; min-width:0; }
+  #chatbar { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 12px;
+             border-bottom:1px solid var(--line); }
+  #chattitle { font-weight:600; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  #chatwrap { flex:1; display:flex; position:relative; min-height:0; min-width:0; }
+  #chat { flex:1; overflow-y:auto; overflow-x:hidden; padding:14px; display:flex; flex-direction:column; gap:10px; min-width:0; }
+  #greeting { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+              justify-content:center; text-align:center; padding:24px; pointer-events:none;
+              user-select:none; color:var(--greet); }
+  .gtitle { font-size:34px; font-weight:600; letter-spacing:-0.5px; }
+  .gsub { margin-top:10px; font-size:14px; }
+  .gtasks { margin-top:6px; font-size:14px; display:none; }
+  .bubble { max-width:85%; padding:9px 12px; border-radius:10px; white-space:pre-wrap; word-wrap:break-word;
+            line-height:1.45; border:1px solid var(--line); }
+  .user { align-self:flex-end; background:var(--user); border-color:var(--user-line); }
+  .agent { align-self:flex-start; background:var(--agent-bg); white-space:normal; min-width:0; }
+  .error { align-self:flex-start; background:var(--err-bg); border-color:var(--err-line); color:var(--bad); }
+  .log { font-size:12px; color:var(--muted); font-family: Consolas, monospace; white-space:pre-wrap; }
+  .card { align-self:stretch; min-width:0; max-width:100%; background:var(--warn); border:1px solid var(--warn-line);
+          border-radius:10px; padding:10px 12px; }
+  .filecard { background:var(--okcard-bg); border-color:var(--okcard-line); }
+  .filecard .row { justify-content:space-between; }
+  .genimage { display:block; max-width:100%; max-height:420px; border-radius:8px; margin-bottom:8px; }
+  .genimage.svgimage { width:min(100%, 480px); background:#fff; }
+  .cardtitle { font-weight:600; margin-bottom:6px; }
+  pre { background:var(--pre-bg); border:1px solid var(--line); border-radius:6px; padding:8px; overflow-x:auto;
+        font-family: Consolas, monospace; font-size:12.5px; margin:6px 0; white-space:pre; }
+  .card pre { max-height:320px; overflow:auto; background:var(--cardpre-bg); }
+  code { background:var(--code-bg); padding:1px 4px; border-radius:4px; font-family: Consolas, monospace; font-size:12.5px; }
+  pre code { background:transparent; padding:0; }
+  .md > :first-child { margin-top:0; }
+  .md > :last-child { margin-bottom:0; }
+  .md p { margin:0 0 8px; white-space:pre-wrap; }
+  .md h3, .md h4, .md h5, .md h6 { margin:12px 0 6px; line-height:1.3; }
+  .md h3 { font-size:17px; } .md h4 { font-size:15.5px; } .md h5, .md h6 { font-size:14.5px; }
+  .md ul, .md ol { margin:0 0 8px; padding-left:22px; }
+  .md li { margin:2px 0; }
+  .md blockquote { margin:0 0 8px; padding:2px 10px; border-left:3px solid var(--line); color:var(--muted); }
+  .md hr { border:none; border-top:1px solid var(--line); margin:10px 0; }
+  .md a { color:var(--accent); }
+  .tablewrap { overflow-x:auto; margin:0 0 8px; }
+  .md table { border-collapse:collapse; font-size:13.5px; }
+  .md th, .md td { border:1px solid var(--line); padding:5px 9px; text-align:left; vertical-align:top; }
+  .md th { background:var(--th-bg); }
+  .codewrap { margin:6px 0 8px; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .codehead { display:flex; justify-content:space-between; align-items:center; background:var(--codehead-bg);
+              padding:3px 6px 3px 10px; font-size:12px; color:var(--muted); }
+  .codehead .btns { display:flex; gap:6px; }
+  .codewrap pre { margin:0; border:none; border-radius:0; }
+  .runout { margin:0; border:none; border-top:1px solid var(--line); border-radius:0; max-height:220px; overflow:auto; }
+  .copybtn { padding:2px 9px; font-size:12px; border-radius:6px; }
+  .bubblebar { display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap; }
+  .bubblebar .copybtn { color:var(--muted); }
+  .took { margin-left:4px; font-size:12px; }
+  #status { padding:4px 14px; min-height:22px; }
+  #editbar { display:flex; align-items:center; gap:10px; padding:6px 14px; background:var(--warn);
+             border-top:1px solid var(--warn-line); font-size:13px; }
+  #composer { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); }
+  textarea { flex:1; resize:none; padding:9px; border:1px solid var(--line); border-radius:8px; font:inherit;
+             background:var(--input-bg); color:var(--text); }
+  button { border:1px solid var(--line); background:var(--btn-bg); color:var(--text); padding:8px 14px;
+           border-radius:8px; cursor:pointer; font:inherit; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.danger { color:var(--bad); }
+  button.wide { width:100%; margin-bottom:10px; }
+  button.small { padding:4px 10px; font-size:13px; }
+  button.on { background:var(--bad); color:#fff; border-color:var(--bad); }
+  button:disabled { opacity:.5; cursor:default; }
+  aside, nav { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px;
+               overflow-y:auto; min-height:0; }
+  aside h3, nav h3 { margin:4px 0 8px; font-size:14px; }
+  .searchbox, .field { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:8px; font:inherit;
+                       font-size:13px; background:var(--input-bg); color:var(--text); margin-bottom:8px; }
+  .tabs { display:flex; gap:4px; margin-bottom:10px; flex-wrap:wrap; }
+  .tabs button { padding:4px 9px; font-size:13px; }
+  .tabs button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .item { font-size:13px; padding:6px 0; border-bottom:1px solid var(--soft-line); }
+  .overdue { color:var(--bad); font-weight:600; }
+  .addtask { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
+  .addtask input { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:8px; font:inherit;
+                   font-size:13px; background:var(--input-bg); color:var(--text); }
+  .addtask .row > * { flex:1; min-width:0; }
+  .taskrow { display:flex; align-items:flex-start; gap:2px; }
+  .tasklabel { flex:1; min-width:0; word-wrap:break-word; padding-top:2px; }
+  .badge { display:inline-block; font-size:11px; padding:0 6px; border-radius:8px; margin-left:4px;
+           background:var(--code-bg); color:var(--muted); font-weight:400; }
+  .badge.high { background:var(--err-bg); color:var(--bad); font-weight:600; }
+  .tick { color:var(--ok); }
+  .tick:hover { color:var(--ok); opacity:.7; }
+  .fileitem { display:flex; align-items:center; gap:2px; font-size:13px; padding:5px 0; border-bottom:1px solid var(--soft-line); }
+  .filelabel { flex:1; min-width:0; }
+  .filename { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #attachbar { display:flex; flex-wrap:wrap; gap:6px; padding:0 10px; }
+  #attachbar:not(:empty) { padding-top:8px; }
+  .chip { display:inline-flex; align-items:center; gap:2px; background:var(--code-bg); border:1px solid var(--line);
+          border-radius:14px; padding:2px 2px 2px 10px; font-size:12.5px; max-width:280px; }
+  .chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chip .iconbtn { font-size:16px; padding:0 6px; }
+  #attach, #mic { padding:8px 11px; }
+  #chatcol.dragging { outline:2px dashed var(--accent); outline-offset:-6px; }
+  .fileline { margin-top:6px; font-size:12.5px; opacity:.85; }
+  .error .retrybtn { display:block; margin-top:8px; color:var(--text); }
+  .chatitem { display:flex; align-items:center; gap:2px; padding:6px 6px; border-radius:8px; cursor:pointer; }
+  .chatitem:hover { background:var(--hover); }
+  .chatitem.current { background:var(--user); }
+  .chatlabel { flex:1; min-width:0; }
+  .chattitle { font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .snippet { font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .renamebox { width:100%; padding:3px 6px; font:inherit; font-size:13px; border:1px solid var(--accent);
+               border-radius:6px; background:var(--input-bg); color:var(--text); }
+  .iconbtn { padding:0 6px; border:none; background:transparent; font-size:17px; color:var(--muted); line-height:1.2; }
+  .iconbtn:hover { color:var(--bad); }
+  .editbtn { font-size:15px; }
+  .editbtn:hover, .pinbtn:hover, .viewbtn:hover { color:var(--accent); }
+  .pinbtn { font-size:15px; }
+  .pinbtn.pinned { color:var(--star); }
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center;
+           justify-content:center; padding:24px; z-index:10; }
+  #modalbox { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(860px, 100%);
+              max-height:88vh; display:flex; flex-direction:column; }
+  #modalhead { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 14px;
+               border-bottom:1px solid var(--line); }
+  #modaltitle { font-weight:600; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #modalbody { padding:14px; overflow:auto; min-height:0; }
+  #modalbody pre { max-height:none; margin:0; }
+  .previewimg { max-width:100%; background:#fff; border-radius:6px; }
+  .settingsbox textarea { width:100%; min-height:110px; margin-bottom:6px; }
+  .settingsbox hr { border:none; border-top:1px solid var(--line); margin:14px 0; }
+  @media (max-width: 1100px) {
+    main { grid-template-columns: 200px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+    aside { grid-column: 1 / -1; max-height: 260px; }
+  }
+  @media (max-width: 700px) {
+    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; }
+    nav { max-height: 170px; }
+  }
+</style>
+<script>
+  (function () {
+    var pref = "system";
+    try { pref = localStorage.getItem("theme") || "system"; } catch (e) {}
+    var dark = pref === "dark" || (pref === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  })();
+</script>
+</head>
+<body>
+<header>
+  <div class="row">
+    <strong>My AI Agent</strong>
+    <select id="modelsel" title="Choose which AI model answers"></select>
+    <span id="usage" class="muted"></span>
+  </div>
+  <div class="row">
+    <label id="webwrap" class="muted" hidden><input type="checkbox" id="web"> Web search (experimental)</label>
+    <label class="muted">Theme
+      <select id="theme" title="Choose light, dark, or follow your computer's setting">
+        <option value="system">Default</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
+  </div>
+</header>
+<main>
+  <nav>
+    <button id="newchat" class="primary wide">+ New chat</button>
+    <input id="search" class="searchbox" type="search" placeholder="Search all chats..." maxlength="100">
+    <h3>Chats</h3>
+    <div id="chatlist" class="muted">loading...</div>
+  </nav>
+  <section id="chatcol">
+    <div id="chatbar">
+      <div id="chattitle">New chat</div>
+      <select id="export" title="Save this chat as a file">
+        <option value="">Export...</option>
+        <option value="md">Markdown (.md)</option>
+        <option value="docx">Word (.docx)</option>
+        <option value="pdf">PDF (.pdf)</option>
+      </select>
+    </div>
+    <div id="chatwrap">
+      <div id="chat"></div>
+      <div id="greeting" hidden>
+        <div class="gtitle" id="gtitle"></div>
+        <div class="gsub" id="gsub"></div>
+        <div class="gtasks" id="gtasks"></div>
+      </div>
+    </div>
+    <div id="status" class="muted"></div>
+    <div id="editbar" hidden>
+      <span>&#9998; Editing your last message. Sending replaces it and its answer.</span>
+      <button id="canceledit" class="small">Cancel</button>
+    </div>
+    <div id="attachbar"></div>
+    <div id="composer">
+      <button id="attach" title="Attach files (or drag them onto the page, or paste a picture)">&#128206;</button>
+      <input type="file" id="fileinput" multiple hidden accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.docx,.xlsx,.pptx,.txt,.md,.csv,.tsv,.json,.xml,.yaml,.yml,.toml,.ini,.log,.py,.js,.ts,.jsx,.tsx,.html,.htm,.css,.php,.sql,.java,.c,.cpp,.h,.cs,.go,.rs,.rb,.kt,.swift">
+      <button id="mic" title="Speak your message" hidden>&#127908;</button>
+      <textarea id="input" rows="2" placeholder="Ask your agent... (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button id="send" class="primary">Send</button>
+      <button id="stop" class="danger" hidden>Stop</button>
+    </div>
+  </section>
+  <aside>
+    <div class="tabs">
+      <button id="tabbtn-tasks" class="active">Tasks</button>
+      <button id="tabbtn-notes">Notes</button>
+      <button id="tabbtn-files">Files</button>
+      <button id="tabbtn-settings">Settings</button>
+    </div>
+
+    <div id="tab-tasks">
+      <div class="addtask">
+        <input id="taskTitle" type="text" maxlength="200" placeholder="New task...">
+        <div class="row">
+          <input id="taskDue" type="date" title="Due date (optional)">
+          <select id="taskPriority" title="Priority">
+            <option value="medium">Medium</option><option value="high">High</option><option value="low">Low</option>
+          </select>
+        </div>
+        <div class="row">
+          <select id="taskRepeat" title="Repeat">
+            <option value="">No repeat</option><option value="daily">Daily</option>
+            <option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+          </select>
+          <button id="taskAdd" class="primary">Add</button>
+        </div>
+      </div>
+      <button id="icsBtn" class="small wide" title="Download your tasks that have a due date, to open in Google Calendar or Outlook">&#128197; Download calendar file</button>
+      <div id="tasks" class="muted">loading...</div>
+    </div>
+
+    <div id="tab-notes" hidden>
+      <div class="addtask">
+        <input id="noteText" type="text" maxlength="300" placeholder="New note...">
+        <button id="noteAdd" class="primary">Add note</button>
+      </div>
+      <div id="notes" class="muted">loading...</div>
+    </div>
+
+    <div id="tab-files" hidden>
+      <button id="filesRefresh" class="small wide">Refresh</button>
+      <div id="files" class="muted">loading...</div>
+    </div>
+
+    <div id="tab-settings" class="settingsbox" hidden>
+      <h3>Your own instructions</h3>
+      <div class="muted">Tell the agent how you like answers: tone, length, language. Saved between sessions.</div>
+      <textarea id="instr" class="field" maxlength="1500" placeholder="For example: Keep answers short. Explain code step by step."></textarea>
+      <button id="instrSave" class="primary small">Save instructions</button>
+      <hr>
+      <h3>Backup</h3>
+      <div class="muted">Saves your chats, tasks, notes, settings and created files in one zip file.</div>
+      <div class="row" style="margin-top:8px">
+        <button id="backupBtn" class="small">Download backup</button>
+        <button id="restoreBtn" class="small">Restore...</button>
+        <input type="file" id="restoreFile" accept=".zip" hidden>
+      </div>
+      <hr>
+      <h3>Good to know</h3>
+      <div class="muted" id="settingsInfo"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="modal" hidden>
+  <div id="modalbox">
+    <div id="modalhead">
+      <div id="modaltitle"></div>
+      <div class="row">
+        <button id="modalDownload" class="small">Download</button>
+        <button id="modalClose" class="small">Close</button>
+      </div>
+    </div>
+    <div id="modalbody"></div>
+  </div>
+</div>
+
+<script>
+const TOKEN = "__TOKEN__";
+const $ = function (id) { return document.getElementById(id); };
+const chat = $("chat"), statusEl = $("status"), input = $("input"), sendBtn = $("send");
+const webBox = $("web"), stopBtn = $("stop"), themeSelect = $("theme");
+let after = 0, busy = false, pendingId = null, lastBusy = false, fatal = "";
+let notice = "", noticeUntil = 0;
+let attachments = [], uploading = 0;
+let busySince = Date.now();
+let userName = "", firstPollDone = false, taskLine = "";
+let currentChatId = "", lastUserEl = null, lastUserText = "", editable = false, editing = false;
+let searchTimer = null;
+const MAX_UPLOAD = 10 * 1024 * 1024;
+const TABS = ["tasks", "notes", "files", "settings"];
+
+// ---------- theme ----------
+function applyTheme() {
+  let pref = "system";
+  try { pref = localStorage.getItem("theme") || "system"; } catch (e) {}
+  if (pref !== "light" && pref !== "dark") pref = "system";
+  const dark = pref === "dark" ||
+    (pref === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  themeSelect.value = pref;
+}
+themeSelect.onchange = function () {
+  try { localStorage.setItem("theme", themeSelect.value); } catch (e) {}
+  applyTheme();
+};
+if (window.matchMedia) {
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  if (mq.addEventListener) mq.addEventListener("change", applyTheme);
+}
+applyTheme();
+
+// ---------- helpers ----------
+async function api(path, options) {
+  options = options || {};
+  options.headers = { "X-Session-Token": TOKEN, "Content-Type": "application/json" };
+  const res = await fetch(path, options);
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    if (res.status === 403) fatal = "Session expired. Reload this page.";
+    throw new Error(data.error || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function showNotice(message) {
+  notice = message;
+  noticeUntil = Date.now() + 5000;
+  setStatus();
+}
+
+function formatDuration(sec) {
+  if (sec < 60) return sec.toFixed(1) + "s";
+  const m = Math.floor(sec / 60);
+  return m + "m " + Math.round(sec - m * 60) + "s";
+}
+
+function formatSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return Math.round(n / 1024) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+function formatWhen(iso) {
+  try {
+    return new Date(iso).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  } catch (e) { return ""; }
+}
+
+async function loadBlobUrl(path) {
+  const res = await fetch("/api/download?path=" + encodeURIComponent(path), { headers: { "X-Session-Token": TOKEN } });
+  if (!res.ok) throw new Error(res.status === 404 ? "That file no longer exists." : "HTTP " + res.status);
+  let blob = await res.blob();
+  if (/\.svg$/i.test(path)) blob = new Blob([blob], { type: "image/svg+xml" });
+  return URL.createObjectURL(blob);
+}
+
+async function downloadFromApi(url, fallbackName) {
+  try {
+    const res = await fetch(url, { headers: { "X-Session-Token": TOKEN } });
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { const j = await res.json(); if (j.error) msg = j.error; } catch (e) {}
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    let name = fallbackName;
+    const cd = res.headers.get("Content-Disposition") || "";
+    const star = /filename\*=(?:UTF-8|utf-8)''([^;]+)/.exec(cd);
+    const plain = /filename="?([^";]+)"?/.exec(cd);
+    if (star) { try { name = decodeURIComponent(star[1]); } catch (e) {} }
+    else if (plain) name = plain[1];
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(objUrl); }, 10000);
+  } catch (e) {
+    showNotice("Could not download: " + e.message);
+  }
+}
+
+function downloadFile(path, name) {
+  downloadFromApi("/api/download?path=" + encodeURIComponent(path), name);
+}
+
+async function copyText(text, btn) {
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand("copy"); } catch (e2) {}
+    ta.remove();
+  }
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.textContent = ok ? "Copied!" : "Copy failed";
+  setTimeout(function () { btn.textContent = btn.dataset.label; }, 1500);
+}
+
+// ---------- read aloud ----------
+function speakableText(t) {
+  return t.replace(/```[\s\S]*?```/g, " code block. ")
+          .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+          .replace(/[`*#>|_~]+/g, " ")
+          .replace(/\s+/g, " ").trim();
+}
+
+function toggleSpeak(text, btn) {
+  if (!("speechSynthesis" in window)) return;
+  if (window.speechSynthesis.speaking) {
+    window.speechSynthesis.cancel();
+    btn.textContent = "Read aloud";
+    return;
+  }
+  const u = new SpeechSynthesisUtterance(speakableText(text));
+  u.onend = function () { btn.textContent = "Read aloud"; };
+  u.onerror = function () { btn.textContent = "Read aloud"; };
+  btn.textContent = "Stop reading";
+  window.speechSynthesis.speak(u);
+}
+
+// ---------- run a code block ----------
+async function runCode(code, outEl, btn) {
+  if (!confirm("Run this code on your computer?\n\nIt runs with your Windows user's permissions (it is NOT a sandbox) and stops after 20 seconds. Only run code you have read and trust.")) return;
+  btn.disabled = true;
+  outEl.hidden = false;
+  outEl.textContent = "Running...";
+  try {
+    const r = await api("/api/run", { method: "POST", body: JSON.stringify({ code: code }) });
+    let text = r.stdout || "";
+    if (r.stderr) text += (text && !text.endsWith("\n") ? "\n" : "") + r.stderr;
+    text += (text ? "\n" : "") + "[exit code " + r.exit_code + (r.timed_out ? ", timed out" : "") + ", " + r.seconds + "s]";
+    outEl.textContent = text;
+  } catch (e) {
+    outEl.textContent = "Could not run: " + e.message;
+  }
+  btn.disabled = false;
+}
+
+// ---------- answer formatting ----------
+function inlineMd(parent, text) {
+  const re = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\s][^*\n]*\*|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const tok = m[0];
+    let el;
+    if (tok[0] === "`") {
+      el = document.createElement("code");
+      el.textContent = tok.slice(1, -1);
+    } else if (tok.indexOf("**") === 0) {
+      el = document.createElement("strong");
+      el.textContent = tok.slice(2, -2);
+    } else if (tok[0] === "*") {
+      el = document.createElement("em");
+      el.textContent = tok.slice(1, -1);
+    } else {
+      const parts = /^\[([^\]]+)\]\((.+)\)$/.exec(tok);
+      el = document.createElement("a");
+      el.textContent = parts[1];
+      el.href = parts[2];
+      el.target = "_blank";
+      el.rel = "noopener noreferrer";
+    }
+    parent.appendChild(el);
+    last = m.index + tok.length;
+  }
+  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+
+function codeBlock(code, lang) {
+  const wrap = document.createElement("div");
+  wrap.className = "codewrap";
+  const head = document.createElement("div");
+  head.className = "codehead";
+  const label = document.createElement("span");
+  label.textContent = lang || "code";
+  const btns = document.createElement("div");
+  btns.className = "btns";
+  const out = document.createElement("pre");
+  out.className = "runout";
+  out.hidden = true;
+  if (/^(python|py)$/i.test(lang || "")) {
+    const run = document.createElement("button");
+    run.className = "copybtn";
+    run.textContent = "Run";
+    run.title = "Run this code on your computer (asks first)";
+    run.onclick = function () { runCode(code, out, run); };
+    btns.appendChild(run);
+  }
+  const btn = document.createElement("button");
+  btn.className = "copybtn";
+  btn.textContent = "Copy code";
+  btn.onclick = function () { copyText(code, btn); };
+  btns.appendChild(btn);
+  head.appendChild(label);
+  head.appendChild(btns);
+  const pre = document.createElement("pre");
+  const c = document.createElement("code");
+  c.textContent = code;
+  pre.appendChild(c);
+  wrap.appendChild(head);
+  wrap.appendChild(pre);
+  wrap.appendChild(out);
+  return wrap;
+}
+
+function tableBlock(rows) {
+  const wrap = document.createElement("div");
+  wrap.className = "tablewrap";
+  const table = document.createElement("table");
+  rows.forEach(function (cells, r) {
+    const tr = document.createElement("tr");
+    cells.forEach(function (text) {
+      const cell = document.createElement(r === 0 ? "th" : "td");
+      inlineMd(cell, text);
+      tr.appendChild(cell);
+    });
+    table.appendChild(tr);
+  });
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function splitRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(function (c) { return c.trim(); });
+}
+
+function renderMarkdown(text) {
+  const root = document.createElement("div");
+  root.className = "md";
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const sepRe = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+  let i = 0, para = [];
+
+  function flushPara() {
+    if (!para.length) return;
+    const p = document.createElement("p");
+    inlineMd(p, para.join("\n"));
+    root.appendChild(p);
+    para = [];
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fence = /^\s*```\s*([\w+#.-]*)\s*$/.exec(line);
+    if (fence) {
+      flushPara();
+      const code = [];
+      i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { code.push(lines[i]); i++; }
+      i++;
+      root.appendChild(codeBlock(code.join("\n"), fence[1]));
+      continue;
+    }
+
+    if (!line.trim()) { flushPara(); i++; continue; }
+
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line.trim());
+    if (heading) {
+      flushPara();
+      const h = document.createElement("h" + (heading[1].length + 2));
+      inlineMd(h, heading[2]);
+      root.appendChild(h);
+      i++;
+      continue;
+    }
+
+    if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
+      flushPara();
+      root.appendChild(document.createElement("hr"));
+      i++;
+      continue;
+    }
+
+    if (line.trim().charAt(0) === "|" && i + 1 < lines.length && sepRe.test(lines[i + 1]) && lines[i + 1].indexOf("-") !== -1) {
+      flushPara();
+      const rows = [splitRow(line)];
+      i += 2;
+      while (i < lines.length && lines[i].trim().charAt(0) === "|") { rows.push(splitRow(lines[i])); i++; }
+      root.appendChild(tableBlock(rows));
+      continue;
+    }
+
+    const bullet = /^(\s*)[-*\u2022]\s+(.*)$/.exec(line);
+    const number = /^(\s*)(\d{1,3})[.)]\s+(.*)$/.exec(line);
+    if (bullet || number) {
+      flushPara();
+      const ordered = !!number;
+      const list = document.createElement(ordered ? "ol" : "ul");
+      if (ordered) list.start = parseInt(number[2], 10);
+      while (i < lines.length) {
+        const b = /^(\s*)[-*\u2022]\s+(.*)$/.exec(lines[i]);
+        const n = /^(\s*)(\d{1,3})[.)]\s+(.*)$/.exec(lines[i]);
+        const m = ordered ? n : b;
+        if (!m) break;
+        const li = document.createElement("li");
+        const indent = Math.min(Math.floor(m[1].replace(/\t/g, "  ").length / 2), 3);
+        if (indent) li.style.marginLeft = (indent * 18) + "px";
+        inlineMd(li, ordered ? m[3] : m[2]);
+        list.appendChild(li);
+        i++;
+      }
+      root.appendChild(list);
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      flushPara();
+      const quote = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) { quote.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+      const bq = document.createElement("blockquote");
+      inlineMd(bq, quote.join("\n"));
+      root.appendChild(bq);
+      continue;
+    }
+
+    para.push(line);
+    i++;
+  }
+  flushPara();
+  return root;
+}
+
+// ---------- greeting and chat view ----------
+function greetingFor(hour) {
+  if (hour >= 5 && hour < 12) return "Good morning";
+  if (hour >= 12 && hour < 17) return "Good afternoon";
+  if (hour >= 17) return "Good evening";
+  return "Hello";
+}
+
+function updateGreeting() {
+  const box = $("greeting");
+  const empty = firstPollDone && chat.children.length === 0;
+  box.hidden = !empty;
+  if (!empty) return;
+  const now = new Date();
+  $("gtitle").textContent = greetingFor(now.getHours()) + (userName ? ", " + userName : "");
+  $("gsub").textContent =
+    now.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" }) + " \u00b7 Ask me anything, or attach a file";
+  const line = $("gtasks");
+  line.textContent = taskLine;
+  line.style.display = taskLine ? "block" : "none";
+}
+
+function add(el) {
+  chat.appendChild(el);
+  chat.scrollTop = chat.scrollHeight;
+  updateGreeting();
+}
+
+function clearChatView() {
+  chat.innerHTML = "";
+  lastUserEl = null;
+  editing = false;
+  $("editbar").hidden = true;
+  updateGreeting();
+}
+
+function userBubble(ev) {
+  const d = document.createElement("div");
+  d.className = "bubble user";
+  d.textContent = ev.text;
+  (ev.files || []).forEach(function (f) {
+    const line = document.createElement("div");
+    line.className = "fileline";
+    line.textContent = "\uD83D\uDCCE " + f.name + " (" + formatSize(f.size) + ")";
+    d.appendChild(line);
+  });
+  lastUserEl = d;
+  lastUserText = ev.text;
+  add(d);
+}
+
+function updateEditButton() {
+  Array.prototype.forEach.call(document.querySelectorAll(".editmsgbar"), function (b) { b.remove(); });
+  if (!lastUserEl || !editable || busy || editing) return;
+  const bar = document.createElement("div");
+  bar.className = "bubblebar editmsgbar";
+  const b = document.createElement("button");
+  b.className = "copybtn";
+  b.textContent = "Edit";
+  b.title = "Change your last message and ask again";
+  b.onclick = startEdit;
+  bar.appendChild(b);
+  lastUserEl.appendChild(bar);
+}
+
+function startEdit() {
+  editing = true;
+  input.value = lastUserText;
+  $("editbar").hidden = false;
+  input.focus();
+  updateEditButton();
+}
+
+function cancelEdit() {
+  editing = false;
+  $("editbar").hidden = true;
+  input.value = "";
+  updateEditButton();
+}
+$("canceledit").onclick = cancelEdit;
+
+function answerBubble(ev) {
+  const d = document.createElement("div");
+  d.className = "bubble agent";
+  const holder = document.createElement("div");
+  d.appendChild(holder);
+  const fresh = typeof ev.ts === "number" && (Date.now() / 1000 - ev.ts) < 8;
+  if (fresh && ev.text.length > 40) {
+    // the answer "types itself" for a moment (a display effect; the full answer is already here)
+    let shown = 0;
+    const step = Math.max(4, Math.ceil(ev.text.length / 90));
+    const timer = setInterval(function () {
+      shown = Math.min(ev.text.length, shown + step);
+      holder.replaceChildren(renderMarkdown(ev.text.slice(0, shown)));
+      chat.scrollTop = chat.scrollHeight;
+      if (shown >= ev.text.length) clearInterval(timer);
+    }, 30);
+  } else {
+    holder.appendChild(renderMarkdown(ev.text));
+  }
+  const bar = document.createElement("div");
+  bar.className = "bubblebar";
+  const copy = document.createElement("button");
+  copy.className = "copybtn";
+  copy.textContent = "Copy";
+  copy.title = "Copy this whole answer";
+  copy.onclick = function () { copyText(ev.text, copy); };
+  bar.appendChild(copy);
+  if ("speechSynthesis" in window) {
+    const speak = document.createElement("button");
+    speak.className = "copybtn";
+    speak.textContent = "Read aloud";
+    speak.onclick = function () { toggleSpeak(ev.text, speak); };
+    bar.appendChild(speak);
+  }
+  if (ev.regen) {
+    removeRetryButtons();
+    const again = document.createElement("button");
+    again.className = "copybtn regenbtn";
+    again.textContent = "Regenerate";
+    again.title = "Ask the same question again";
+    again.onclick = retryLast;
+    bar.appendChild(again);
+  }
+  if (typeof ev.seconds === "number") {
+    const took = document.createElement("span");
+    took.className = "muted took";
+    took.textContent = "Responded in " + formatDuration(ev.seconds);
+    bar.appendChild(took);
+  }
+  d.appendChild(bar);
+  add(d);
+}
+
+function fileCard(ev) {
+  const card = document.createElement("div");
+  card.className = "card filecard";
+  if (ev.image) {
+    const img = document.createElement("img");
+    img.className = "genimage" + (/\.svg$/i.test(ev.name) ? " svgimage" : "");
+    img.alt = ev.name;
+    img.onload = function () { chat.scrollTop = chat.scrollHeight; };
+    loadBlobUrl(ev.path).then(function (url) { img.src = url; }).catch(function () { img.remove(); });
+    card.appendChild(img);
+  }
+  const row = document.createElement("div");
+  row.className = "row";
+  const label = document.createElement("div");
+  label.textContent = (ev.image ? "\uD83D\uDDBC " : "\uD83D\uDCC4 ") + ev.name + (ev.size ? " (" + formatSize(ev.size) + ")" : "");
+  const btn = document.createElement("button");
+  btn.className = "primary";
+  btn.textContent = "Download";
+  btn.onclick = function () { downloadFile(ev.path, ev.name); };
+  row.appendChild(label);
+  row.appendChild(btn);
+  card.appendChild(row);
+  add(card);
+}
+
+function approvalCard(ev) {
+  const card = document.createElement("div");
+  card.className = "card";
+  const title = document.createElement("div");
+  title.className = "cardtitle";
+  title.textContent = "Approval needed";
+  const pre = document.createElement("pre");
+  pre.textContent = ev.text;
+  const bar = document.createElement("div");
+  bar.className = "row";
+  card.appendChild(title);
+  card.appendChild(pre);
+  card.appendChild(bar);
+
+  if (ev.decision) {
+    const words = { approved: "You approved this.", denied: "You denied this.", expired: "No answer in time, so it was denied." };
+    bar.textContent = words[ev.decision] || ev.decision;
+  } else if (pendingId === ev.approval_id) {
+    const yes = document.createElement("button");
+    yes.className = "primary";
+    yes.textContent = "Approve";
+    const no = document.createElement("button");
+    no.className = "danger";
+    no.textContent = "Deny";
+    bar.appendChild(yes);
+    bar.appendChild(no);
+    const answer = async function (ok) {
+      yes.disabled = true; no.disabled = true;
+      try {
+        await api("/api/approve", { method: "POST", body: JSON.stringify({ approval_id: ev.approval_id, approved: ok }) });
+        bar.textContent = ok ? "You approved this." : "You denied this.";
+      } catch (e) {
+        bar.textContent = "Could not send your answer: " + e.message;
+      }
+    };
+    yes.onclick = function () { answer(true); };
+    no.onclick = function () { answer(false); };
+  } else {
+    bar.textContent = "(already answered or expired)";
+    bar.className = "muted";
+  }
+  add(card);
+}
+
+function render(ev) {
+  if (ev.type === "user") userBubble(ev);
+  else if (ev.type === "answer") answerBubble(ev);
+  else if (ev.type === "file") fileCard(ev);
+  else if (ev.type === "error") {
+    const d = document.createElement("div");
+    d.className = "bubble error";
+    d.textContent = "Error: " + ev.text + (ev.hint ? "\n" + ev.hint : "");
+    if (ev.retry) {
+      const b = document.createElement("button");
+      b.className = "retrybtn";
+      b.textContent = "Try again";
+      b.onclick = retryLast;
+      d.appendChild(b);
+    }
+    add(d);
+  }
+  else if (ev.type === "log") {
+    if (ev.quiet) return;  // technical lines are kept for the agent's memory but not shown
+    const d = document.createElement("div");
+    d.className = "log";
+    d.textContent = ev.text.trim();
+    add(d);
+  }
+  else if (ev.type === "approval") approvalCard(ev);
+}
+
+function setStatus() {
+  if (fatal) statusEl.textContent = fatal;
+  else if (notice && Date.now() < noticeUntil) statusEl.textContent = notice;
+  else if (pendingId) statusEl.textContent = "Waiting for your approval above...";
+  else if (uploading) statusEl.textContent = "Uploading...";
+  else if (busy) statusEl.textContent = "Working... " + Math.round((Date.now() - busySince) / 1000) + "s (press Stop to cancel)";
+  else statusEl.textContent = "";
+  sendBtn.disabled = busy || uploading > 0;
+  stopBtn.hidden = !busy;
+}
+
+// ---------- chat list, search, pin, rename, export ----------
+function startRename(c, titleEl) {
+  const box = document.createElement("input");
+  box.type = "text";
+  box.className = "renamebox";
+  box.value = c.title;
+  box.maxLength = 80;
+  box.placeholder = "Chat name (empty = automatic)";
+  titleEl.replaceWith(box);
+  box.focus();
+  box.select();
+  let done = false;
+  const finish = async function (save) {
+    if (done) return;
+    done = true;
+    if (save && box.value.trim() !== c.title) {
+      try {
+        await api("/api/chats/" + c.id + "/rename", { method: "POST", body: JSON.stringify({ title: box.value }) });
+      } catch (e) {
+        showNotice("Could not rename: " + e.message);
+      }
+    }
+    loadChats();
+  };
+  box.addEventListener("keydown", function (e) {
+    e.stopPropagation();
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  });
+  box.addEventListener("click", function (e) { e.stopPropagation(); });
+  box.addEventListener("blur", function () { finish(true); });
+}
+
+async function togglePin(c) {
+  try {
+    await api("/api/chats/" + c.id + "/pin", { method: "POST", body: JSON.stringify({ pinned: !c.pinned }) });
+    loadChats();
+  } catch (e) {
+    showNotice(e.message);
+  }
+}
+
+function chatRow(c, current) {
+  const row = document.createElement("div");
+  row.className = "chatitem" + (c.id === current ? " current" : "");
+  const pin = document.createElement("button");
+  pin.className = "iconbtn pinbtn" + (c.pinned ? " pinned" : "");
+  pin.title = c.pinned ? "Unpin this chat" : "Pin this chat to the top";
+  pin.textContent = c.pinned ? "\u2605" : "\u2606";
+  pin.onclick = function (e) { e.stopPropagation(); togglePin(c); };
+  const label = document.createElement("div");
+  label.className = "chatlabel";
+  const t = document.createElement("div");
+  t.className = "chattitle";
+  t.textContent = c.title;
+  t.title = c.title;
+  const when = document.createElement("div");
+  when.className = "muted";
+  when.textContent = formatWhen(c.updated);
+  label.appendChild(t);
+  label.appendChild(when);
+  label.onclick = function () { openChat(c.id); };
+  const edit = document.createElement("button");
+  edit.className = "iconbtn editbtn";
+  edit.title = "Rename this chat";
+  edit.textContent = "\u270E";
+  edit.onclick = function (e) { e.stopPropagation(); startRename(c, t); };
+  const del = document.createElement("button");
+  del.className = "iconbtn";
+  del.title = "Delete this chat";
+  del.textContent = "\u00d7";
+  del.onclick = function (e) { e.stopPropagation(); deleteChat(c.id, c.title); };
+  row.appendChild(pin);
+  row.appendChild(label);
+  row.appendChild(edit);
+  row.appendChild(del);
+  return row;
+}
+
+async function loadChats() {
+  try {
+    const d = await api("/api/chats");
+    currentChatId = d.current;
+    const cur = d.chats.find(function (c) { return c.id === d.current; });
+    $("chattitle").textContent = cur ? cur.title : "New chat";
+    if ($("search").value.trim()) return;  // search results are showing
+    const list = $("chatlist");
+    list.innerHTML = "";
+    if (!d.chats.length) {
+      list.className = "muted";
+      list.textContent = "No saved chats yet.";
+      return;
+    }
+    list.className = "";
+    d.chats.forEach(function (c) { list.appendChild(chatRow(c, d.current)); });
+  } catch (e) { /* the polling loop shows connection problems */ }
+}
+
+async function runSearch() {
+  const q = $("search").value.trim();
+  if (q.length < 2) { loadChats(); return; }
+  try {
+    const d = await api("/api/search?q=" + encodeURIComponent(q));
+    const list = $("chatlist");
+    list.innerHTML = "";
+    list.className = "";
+    if (!d.results.length) {
+      list.className = "muted";
+      list.textContent = "No chats contain that text.";
+      return;
+    }
+    d.results.forEach(function (r) {
+      const row = document.createElement("div");
+      row.className = "chatitem";
+      const label = document.createElement("div");
+      label.className = "chatlabel";
+      const t = document.createElement("div");
+      t.className = "chattitle";
+      t.textContent = r.title;
+      const sn = document.createElement("div");
+      sn.className = "snippet";
+      sn.textContent = r.snippet || "(title match)";
+      const when = document.createElement("div");
+      when.className = "muted";
+      when.textContent = formatWhen(r.updated) + (r.hits ? " \u00b7 " + r.hits + " match" + (r.hits === 1 ? "" : "es") : "");
+      label.appendChild(t);
+      label.appendChild(sn);
+      label.appendChild(when);
+      row.appendChild(label);
+      row.onclick = function () { openChat(r.id); };
+      list.appendChild(row);
+    });
+  } catch (e) {
+    showNotice(e.message);
+  }
+}
+$("search").addEventListener("input", function () {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 300);
+});
+
+async function openChat(id) {
+  try {
+    const d = await api("/api/chats/" + id + "/open", { method: "POST", body: "{}" });
+    clearChatView();
+    discardAttachments();
+    after = d.after;
+    $("search").value = "";
+    loadChats();
+  } catch (e) {
+    showNotice(e.message);
+  }
+}
+
+async function deleteChat(id, title) {
+  if (!confirm("Delete the chat \"" + title + "\"? This cannot be undone.")) return;
+  try {
+    const d = await api("/api/chats/" + id, { method: "DELETE" });
+    if (d.reset) { clearChatView(); after = d.after; discardAttachments(); }
+    loadChats();
+  } catch (e) {
+    showNotice(e.message);
+  }
+}
+
+$("export").onchange = function () {
+  const format = $("export").value;
+  $("export").value = "";
+  if (!format || !currentChatId) return;
+  downloadFromApi("/api/chats/" + currentChatId + "/export?format=" + format, "chat." + format);
+};
+
+$("newchat").onclick = async function () {
+  try {
+    const d = await api("/api/new", { method: "POST", body: "{}" });
+    clearChatView();
+    discardAttachments();
+    after = d.after;
+    loadChats();
+  } catch (e) {
+    showNotice(e.message);
+  }
+};
+
+// ---------- models and usage ----------
+async function loadModels() {
+  try {
+    const d = await api("/api/models");
+    const sel = $("modelsel");
+    sel.innerHTML = "";
+    d.models.forEach(function (name) {
+      const o = document.createElement("option");
+      o.value = name;
+      o.textContent = name;
+      sel.appendChild(o);
+    });
+    sel.value = d.current;
+  } catch (e) { /* the model menu simply stays empty */ }
+}
+$("modelsel").onchange = async function () {
+  try {
+    await api("/api/model", { method: "POST", body: JSON.stringify({ model: $("modelsel").value }) });
+    showNotice("Model changed to " + $("modelsel").value + ".");
+  } catch (e) {
+    showNotice(e.message);
+    loadModels();
+  }
+};
+
+// ---------- tasks, notes, settings (right panel) ----------
+function ymd(dateStr, plusDays) {
+  const p = dateStr.split("-").map(Number);
+  const d = new Date(p[0], p[1] - 1, p[2] + (plusDays || 0));
+  return d.getFullYear() + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0");
+}
+
+function openCalendar(t) {
+  let url = "https://calendar.google.com/calendar/render?action=TEMPLATE&text=" + encodeURIComponent(t.title) +
+            "&dates=" + ymd(t.due, 0) + "/" + ymd(t.due, 1);
+  if (t.repeat) url += "&recur=" + encodeURIComponent("RRULE:FREQ=" + t.repeat.toUpperCase());
+  window.open(url, "_blank", "noopener");
+}
+
+function badge(text, cls) {
+  const s = document.createElement("span");
+  s.className = "badge" + (cls ? " " + cls : "");
+  s.textContent = text;
+  return s;
+}
+
+function renderTasks(s) {
+  const tasks = $("tasks");
+  tasks.innerHTML = "";
+  if (!s.tasks.length) tasks.textContent = "No open tasks.";
+  s.tasks.forEach(function (t) {
+    const row = document.createElement("div");
+    row.className = "item taskrow" + (t.overdue ? " overdue" : "");
+    const tick = document.createElement("button");
+    tick.className = "iconbtn tick";
+    tick.title = "Mark as done";
+    tick.textContent = "\u2713";
+    tick.onclick = function () { taskAction("/api/tasks/" + t.id + "/complete", "POST"); };
+    const label = document.createElement("div");
+    label.className = "tasklabel";
+    label.textContent = t.title + (t.due ? " (due " + t.due + ")" : "") + (t.overdue ? " - OVERDUE" : "");
+    if (t.priority === "high") label.appendChild(badge("High", "high"));
+    if (t.priority === "low") label.appendChild(badge("Low"));
+    if (t.repeat) label.appendChild(badge("\uD83D\uDD01 " + t.repeat));
+    row.appendChild(tick);
+    row.appendChild(label);
+    if (t.due) {
+      const cal = document.createElement("button");
+      cal.className = "iconbtn viewbtn";
+      cal.title = "Add to Google Calendar";
+      cal.textContent = "\uD83D\uDCC5";
+      cal.onclick = function () { openCalendar(t); };
+      row.appendChild(cal);
+    }
+    const del = document.createElement("button");
+    del.className = "iconbtn";
+    del.title = "Delete this task";
+    del.textContent = "\u00d7";
+    del.onclick = function () {
+      if (confirm("Delete this task?\n\n" + t.title)) taskAction("/api/tasks/" + t.id, "DELETE");
+    };
+    row.appendChild(del);
+    tasks.appendChild(row);
+  });
+}
+
+function renderNotes(s) {
+  const notes = $("notes");
+  notes.innerHTML = "";
+  if (!s.notes.length) notes.textContent = "No saved notes.";
+  s.notes.forEach(function (n) {
+    const row = document.createElement("div");
+    row.className = "item taskrow";
+    const label = document.createElement("div");
+    label.className = "tasklabel";
+    label.textContent = n.fact;
+    const edit = document.createElement("button");
+    edit.className = "iconbtn editbtn";
+    edit.title = "Edit this note";
+    edit.textContent = "\u270E";
+    edit.onclick = async function () {
+      const text = prompt("Edit this note:", n.fact);
+      if (text === null || !text.trim() || text.trim() === n.fact) return;
+      try {
+        await api("/api/notes/" + n.id, { method: "PUT", body: JSON.stringify({ fact: text }) });
+        loadState();
+      } catch (e) { showNotice(e.message); }
+    };
+    const del = document.createElement("button");
+    del.className = "iconbtn";
+    del.title = "Delete this note";
+    del.textContent = "\u00d7";
+    del.onclick = async function () {
+      if (!confirm("Delete this note?\n\n" + n.fact)) return;
+      try {
+        await api("/api/notes/" + n.id, { method: "DELETE" });
+        loadState();
+      } catch (e) { showNotice(e.message); }
+    };
+    row.appendChild(label);
+    row.appendChild(edit);
+    row.appendChild(del);
+    notes.appendChild(row);
+  });
+}
+
+async function loadState() {
+  try {
+    const s = await api("/api/state");
+    userName = s.user_name || "";
+    let dueToday = 0, overdue = 0;
+    s.tasks.forEach(function (t) {
+      if (t.overdue) overdue++;
+      else if (t.due === s.today) dueToday++;
+    });
+    const parts = [];
+    if (dueToday) parts.push(dueToday + (dueToday === 1 ? " task" : " tasks") + " due today");
+    if (overdue) parts.push(overdue + " overdue");
+    taskLine = parts.join(" \u00b7 ");
+    updateGreeting();
+    $("webwrap").hidden = !s.web_search;
+    $("usage").textContent = "Today: " + s.usage.requests + (s.usage.requests === 1 ? " request" : " requests") +
+      (s.usage.images ? " \u00b7 " + s.usage.images + (s.usage.images === 1 ? " picture" : " pictures") : "");
+    if (document.activeElement !== $("instr")) $("instr").value = s.instructions || "";
+    $("settingsInfo").textContent =
+      "Password protection: " + (s.password_on ? "on." : "off (set APP_PASSWORD in .env to turn it on).") +
+      " The model you pick at the top is remembered and wins over GEMINI_MODEL in .env." +
+      " Voice input uses your browser's speech service (in Chrome and Edge it sends the audio to the browser maker for recognition)." +
+      " For a morning notification run: python reminder.py --install 08:00";
+    renderTasks(s);
+    renderNotes(s);
+  } catch (e) { /* the polling loop shows connection problems */ }
+}
+
+async function taskAction(path, method) {
+  try {
+    await api(path, { method: method, body: method === "POST" ? "{}" : undefined });
+    loadState();
+  } catch (e) {
+    showNotice(e.message);
+  }
+}
+
+async function addTask() {
+  const titleBox = $("taskTitle");
+  const title = titleBox.value.trim();
+  if (!title) return;
+  try {
+    await api("/api/tasks", { method: "POST", body: JSON.stringify({
+      title: title, due_date: $("taskDue").value || null,
+      priority: $("taskPriority").value, repeat: $("taskRepeat").value || null }) });
+    titleBox.value = "";
+    $("taskDue").value = "";
+    $("taskPriority").value = "medium";
+    $("taskRepeat").value = "";
+    loadState();
+  } catch (e) {
+    showNotice("Could not add the task: " + e.message);
+  }
+}
+$("taskAdd").onclick = addTask;
+$("taskTitle").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") { e.preventDefault(); addTask(); }
+});
+$("icsBtn").onclick = function () { downloadFromApi("/api/tasks.ics", "tasks.ics"); };
+
+async function addNote() {
+  const box = $("noteText");
+  const fact = box.value.trim();
+  if (!fact) return;
+  try {
+    await api("/api/notes", { method: "POST", body: JSON.stringify({ fact: fact }) });
+    box.value = "";
+    loadState();
+  } catch (e) {
+    showNotice("Could not add the note: " + e.message);
+  }
+}
+$("noteAdd").onclick = addNote;
+$("noteText").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") { e.preventDefault(); addNote(); }
+});
+
+$("instrSave").onclick = async function () {
+  try {
+    await api("/api/instructions", { method: "POST", body: JSON.stringify({ text: $("instr").value }) });
+    showNotice("Instructions saved.");
+  } catch (e) {
+    showNotice("Could not save: " + e.message);
+  }
+};
+
+$("backupBtn").onclick = function () { downloadFromApi("/api/backup", "agent-backup.zip"); };
+$("restoreBtn").onclick = function () { $("restoreFile").click(); };
+$("restoreFile").onchange = async function () {
+  const file = $("restoreFile").files[0];
+  $("restoreFile").value = "";
+  if (!file) return;
+  if (!confirm("Restore from \"" + file.name + "\"?\n\nThis replaces your tasks, notes and settings with the ones in the backup, and adds (or overwrites) the chats and files it contains.")) return;
+  try {
+    const res = await fetch("/api/restore", {
+      method: "POST",
+      headers: { "X-Session-Token": TOKEN, "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    showNotice("Restored: " + data.summary + ". Reloading...");
+    setTimeout(function () { location.reload(); }, 1500);
+  } catch (e) {
+    showNotice("Restore failed: " + e.message);
+  }
+};
+
+// ---------- files panel and preview ----------
+async function loadFiles() {
+  try {
+    const d = await api("/api/files");
+    const box = $("files");
+    box.innerHTML = "";
+    if (!d.files.length) { box.textContent = "The workspace is empty."; return; }
+    box.className = "";
+    d.files.forEach(function (f) {
+      const row = document.createElement("div");
+      row.className = "fileitem";
+      const label = document.createElement("div");
+      label.className = "filelabel";
+      const name = document.createElement("div");
+      name.className = "filename";
+      name.textContent = f.name;
+      name.title = f.path;
+      const meta = document.createElement("div");
+      meta.className = "muted";
+      meta.textContent = f.path.indexOf("/") > 0 ? f.path.slice(0, f.path.lastIndexOf("/") + 1) + " \u00b7 " + formatSize(f.size)
+                                                  : formatSize(f.size);
+      label.appendChild(name);
+      label.appendChild(meta);
+      const view = document.createElement("button");
+      view.className = "iconbtn viewbtn";
+      view.title = "Preview";
+      view.textContent = "\uD83D\uDC41";
+      view.onclick = function () { openPreview(f); };
+      const dl = document.createElement("button");
+      dl.className = "iconbtn viewbtn";
+      dl.title = "Download";
+      dl.textContent = "\u2B07";
+      dl.onclick = function () { downloadFile(f.path, f.name); };
+      const del = document.createElement("button");
+      del.className = "iconbtn";
+      del.title = "Delete this file";
+      del.textContent = "\u00d7";
+      del.onclick = async function () {
+        if (!confirm("Delete this file from the workspace?\n\n" + f.path + "\n\nThis cannot be undone.")) return;
+        try {
+          await api("/api/files?path=" + encodeURIComponent(f.path), { method: "DELETE" });
+          loadFiles();
+        } catch (e) { showNotice(e.message); }
+      };
+      row.appendChild(label);
+      row.appendChild(view);
+      row.appendChild(dl);
+      row.appendChild(del);
+      box.appendChild(row);
+    });
+    if (d.more) {
+      const more = document.createElement("div");
+      more.className = "muted";
+      more.textContent = "Showing the newest " + d.files.length + " files.";
+      box.appendChild(more);
+    }
+  } catch (e) { /* ignore */ }
+}
+$("filesRefresh").onclick = loadFiles;
+
+async function openPreview(f) {
+  $("modaltitle").textContent = f.path;
+  const body = $("modalbody");
+  body.textContent = "Loading...";
+  $("modal").hidden = false;
+  $("modalDownload").onclick = function () { downloadFile(f.path, f.name); };
+  try {
+    const p = await api("/api/files/preview?path=" + encodeURIComponent(f.path));
+    body.innerHTML = "";
+    if (p.kind === "text") {
+      const pre = document.createElement("pre");
+      pre.textContent = p.text + (p.truncated ? "\n\n... (shortened)" : "");
+      body.appendChild(pre);
+    } else if (p.kind === "image") {
+      const img = document.createElement("img");
+      img.className = "previewimg";
+      body.appendChild(img);
+      img.src = await loadBlobUrl(f.path);
+    } else {
+      body.textContent = p.note || "No preview for this file type. Use Download.";
+    }
+  } catch (e) {
+    body.textContent = "Could not preview: " + e.message;
+  }
+}
+function closePreview() { $("modal").hidden = true; $("modalbody").innerHTML = ""; }
+$("modalClose").onclick = closePreview;
+$("modal").addEventListener("click", function (e) { if (e.target === $("modal")) closePreview(); });
+document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$("modal").hidden) closePreview(); });
+
+// ---------- tabs ----------
+function showTab(name) {
+  TABS.forEach(function (t) {
+    $("tab-" + t).hidden = t !== name;
+    $("tabbtn-" + t).classList.toggle("active", t === name);
+  });
+  try { localStorage.setItem("tab", name); } catch (e) {}
+  if (name === "files") loadFiles();
+}
+TABS.forEach(function (t) { $("tabbtn-" + t).onclick = function () { showTab(t); }; });
+
+// ---------- polling ----------
+async function poll() {
+  while (true) {
+    try {
+      const d = await api("/api/events?after=" + after);
+      pendingId = d.pending;
+      d.events.forEach(render);
+      if (!firstPollDone) { firstPollDone = true; updateGreeting(); }
+      after = d.next;
+      busy = d.busy;
+      editable = !!d.editable;
+      if (busy && !lastBusy) busySince = Date.now();
+      if (lastBusy && !busy) {
+        loadState();
+        loadChats();
+        if (!$("tab-files").hidden) loadFiles();
+      }
+      lastBusy = busy;
+      updateEditButton();
+      if (!fatal) setStatus();
+    } catch (e) {
+      statusEl.textContent = fatal || ("Connection problem: " + e.message);
+    }
+    await new Promise(function (r) { setTimeout(r, 700); });
+  }
+}
+
+// ---------- attachments ----------
+function renderAttachments() {
+  const bar = $("attachbar");
+  bar.innerHTML = "";
+  attachments.forEach(function (a) {
+    const chip = document.createElement("div");
+    chip.className = "chip";
+    const label = document.createElement("span");
+    label.textContent = "\uD83D\uDCCE " + a.name + " (" + formatSize(a.size) + ")";
+    label.title = a.name;
+    const x = document.createElement("button");
+    x.className = "iconbtn";
+    x.textContent = "\u00d7";
+    x.title = "Remove";
+    x.onclick = function () { removeAttachment(a.id); };
+    chip.appendChild(label);
+    chip.appendChild(x);
+    bar.appendChild(chip);
+  });
+  setStatus();
+}
+
+async function uploadFile(file) {
+  if (file.size === 0) { showNotice(file.name + " is empty."); return; }
+  if (file.size > MAX_UPLOAD) { showNotice(file.name + " is too big (the limit is 10 MB)."); return; }
+  if (attachments.length + uploading >= 5) { showNotice("You can attach up to 5 files per message."); return; }
+  uploading++;
+  setStatus();
+  try {
+    const res = await fetch("/api/uploads", {
+      method: "POST",
+      headers: { "X-Session-Token": TOKEN, "X-Filename": encodeURIComponent(file.name), "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (!res.ok) {
+      if (res.status === 403) fatal = "Session expired. Reload this page.";
+      throw new Error(data.error || ("HTTP " + res.status));
+    }
+    attachments.push({ id: data.id, name: data.name, size: data.size });
+  } catch (e) {
+    showNotice("Could not attach " + file.name + ": " + e.message);
+  } finally {
+    uploading--;
+    renderAttachments();
+  }
+}
+
+async function removeAttachment(id) {
+  attachments = attachments.filter(function (a) { return a.id !== id; });
+  renderAttachments();
+  try { await api("/api/uploads/" + id, { method: "DELETE" }); } catch (e) { /* already gone */ }
+}
+
+function discardAttachments() {
+  attachments.forEach(function (a) { api("/api/uploads/" + a.id, { method: "DELETE" }).catch(function () {}); });
+  attachments = [];
+  renderAttachments();
+}
+
+// ---------- sending ----------
+function removeRetryButtons() {
+  Array.prototype.forEach.call(document.querySelectorAll(".retrybtn, .regenbtn"), function (b) { b.remove(); });
+}
+
+async function send() {
+  const text = input.value.trim();
+  if ((!text && !attachments.length && !editing) || busy || uploading) return;
+  const ids = attachments.map(function (a) { return a.id; });
+  const wasEditing = editing;
+  input.value = "";
+  try {
+    await api("/api/chat", { method: "POST", body: JSON.stringify({
+      message: text, use_search: webBox.checked, attachments: ids, edit_last: wasEditing }) });
+    if (wasEditing && lastUserEl) {  // the old message and everything after it are gone on the server
+      while (lastUserEl.nextSibling) chat.removeChild(lastUserEl.nextSibling);
+      chat.removeChild(lastUserEl);
+      lastUserEl = null;
+      editing = false;
+      $("editbar").hidden = true;
+      updateGreeting();
+    }
+    attachments = [];
+    renderAttachments();
+    removeRetryButtons();
+    busy = true;
+    busySince = Date.now();
+    setStatus();
+    loadChats();
+  } catch (e) {
+    input.value = text;
+    showNotice("Could not send: " + e.message);
+  }
+}
+
+sendBtn.onclick = send;
+input.addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+
+async function retryLast() {
+  removeRetryButtons();
+  try {
+    await api("/api/retry", { method: "POST", body: "{}" });
+    busy = true;
+    busySince = Date.now();
+    setStatus();
+  } catch (e) {
+    showNotice(e.message);
+  }
+}
+
+stopBtn.onclick = async function () {
+  stopBtn.disabled = true;
+  try { await api("/api/stop", { method: "POST", body: "{}" }); } catch (e) { showNotice(e.message); }
+  stopBtn.disabled = false;
+};
+
+// ---------- drag and drop, paste, attach button ----------
+const chatCol = $("chatcol");
+const fileInput = $("fileinput");
+function hasFiles(e) { return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], "Files") !== -1; }
+["dragenter", "dragover"].forEach(function (name) {
+  chatCol.addEventListener(name, function (e) { if (hasFiles(e)) { e.preventDefault(); chatCol.classList.add("dragging"); } });
+});
+["dragleave", "drop"].forEach(function (name) {
+  chatCol.addEventListener(name, function () { chatCol.classList.remove("dragging"); });
+});
+chatCol.addEventListener("drop", function (e) {
+  if (e.dataTransfer && e.dataTransfer.files.length) {
+    e.preventDefault();
+    Array.prototype.forEach.call(e.dataTransfer.files, uploadFile);
+  }
+});
+window.addEventListener("dragover", function (e) { if (hasFiles(e)) e.preventDefault(); });
+window.addEventListener("drop", function (e) { if (hasFiles(e)) e.preventDefault(); });
+input.addEventListener("paste", function (e) {
+  const files = e.clipboardData ? Array.prototype.slice.call(e.clipboardData.files) : [];
+  if (files.length) { e.preventDefault(); files.forEach(uploadFile); }
+});
+$("attach").onclick = function () { fileInput.click(); };
+fileInput.onchange = function () {
+  Array.prototype.forEach.call(fileInput.files, uploadFile);
+  fileInput.value = "";
+};
+
+// ---------- voice input ----------
+const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (SpeechRec) {
+  $("mic").hidden = false;
+  let rec = null, listening = false;
+  $("mic").onclick = function () {
+    if (listening && rec) { rec.stop(); return; }
+    rec = new SpeechRec();
+    rec.lang = navigator.language || "en-US";
+    rec.interimResults = true;
+    rec.continuous = false;
+    const base = input.value ? input.value.replace(/\s+$/, "") + " " : "";
+    rec.onresult = function (e) {
+      let text = "";
+      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
+      input.value = base + text;
+    };
+    rec.onend = function () { listening = false; $("mic").classList.remove("on"); };
+    rec.onerror = function (e) { showNotice("Voice input: " + e.error); };
+    try {
+      rec.start();
+      listening = true;
+      $("mic").classList.add("on");
+    } catch (e) {
+      showNotice("Could not start voice input.");
+    }
+  };
+}
+
+// ---------- start ----------
+setInterval(updateGreeting, 60000);  // the greeting follows the clock while the chat is empty
+let startTab = "tasks";
+try { startTab = localStorage.getItem("tab") || "tasks"; } catch (e) {}
+showTab(TABS.indexOf(startTab) >= 0 ? startTab : "tasks");
+loadState();
+loadChats();
+loadModels();
+poll();
+</script>
+</body>
+</html>

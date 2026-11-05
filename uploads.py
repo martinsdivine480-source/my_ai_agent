@@ -1,15 +1,33 @@
 """Helpers for files you attach in the browser: safe names, type checks, text extraction
 from Word / Excel / PowerPoint files, and building the message sent to the model.
 
-Nothing here needs extra packages: Office files are ZIP archives of XML, which Python can read."""
+Office files are ZIP archives of XML, which Python can read without extra packages.
+Long documents are drawn as page pictures when Pillow is installed (pip install pillow);
+without Pillow they are sent as text instead."""
 import base64
 import io
+import os
 import posixpath
 import re
 import secrets
+import textwrap
 import zipfile
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # Pillow is optional
+    Image = ImageDraw = ImageFont = None
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024            # one file
 MAX_FOLDER_BYTES = 200 * 1024 * 1024           # everything in workspace/uploads
@@ -23,6 +41,15 @@ MAX_PART_BYTES = 20 * 1024 * 1024              # one XML part inside an Office f
 MAX_SHEETS = 10
 MAX_SHEET_ROWS = 5000
 MAX_COLUMNS = 200
+
+# A text, Word, Excel or PowerPoint file with more characters than this is drawn as page
+# pictures instead of being pasted in as text. Set DOC_IMAGE_OVER_CHARS=0 in .env to turn it off.
+IMAGE_OVER_CHARS = _env_int("DOC_IMAGE_OVER_CHARS", 4000)
+MAX_RENDER_PAGES = max(1, _env_int("DOC_IMAGE_MAX_PAGES", 10))  # pictures per file
+PAGE_W, PAGE_H, MARGIN = 1240, 1754, 60
+FONT_SIZE, LINE_H = 18, 24
+FONT_CANDIDATES = ("consola.ttf", "Consolas.ttf", "DejaVuSansMono.ttf", "LiberationMono-Regular.ttf",
+                   "cour.ttf", "Menlo.ttc")
 
 # Files whose text is read directly.
 TEXT_EXTENSIONS = {
@@ -41,6 +68,8 @@ SUPPORTED_TEXT = ("PDF, pictures (.png .jpg .jpeg .webp .bmp), Word (.docx), Exc
                   ".json .py .html")
 DEFAULT_REQUEST = ("Please read the attached file(s), tell me what they contain, and point out "
                    "anything important or anything that may need my action.")
+PASTED_REQUEST = ("I pasted a long text. It is attached as a file. Read it and respond to it exactly "
+                  "as if I had typed it in this message (follow any instructions I wrote in it).")
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
@@ -310,6 +339,90 @@ def office_to_text(ext: str, data: bytes) -> str:
 
 
 # ---------------------------------------------------------------
+# Long documents -> page pictures
+# ---------------------------------------------------------------
+def _load_font(size: int):
+    for name in FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)  # Pillow 10.1 or newer
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _mostly_latin(text: str) -> bool:
+    """The drawing font cannot show Arabic, Chinese etc., so such text is sent as text instead."""
+    sample = text[:20000]
+    odd = sum(1 for ch in sample if ord(ch) > 0x2FF and not 0x2000 <= ord(ch) <= 0x2BFF)
+    return odd <= len(sample) * 0.02
+
+
+def render_text_pages(text: str, title: str, max_pages: int):
+    """Draw text onto page pictures. Returns (list of PNG bytes, characters covered)."""
+    font = _load_font(FONT_SIZE)
+    char_w = max(1.0, font.getlength("M"))
+    cols = max(40, int((PAGE_W - 2 * MARGIN) / char_w))
+    lines_per_page = max(20, (PAGE_H - 2 * MARGIN - 2 * LINE_H) // LINE_H)
+
+    pages, ends = [], []
+    current, offset = [], 0
+    for source_line in text.split("\n"):
+        pieces = [source_line[i:i + 2000] for i in range(0, len(source_line), 2000)] or [""]
+        for index, piece in enumerate(pieces):
+            wrapped = textwrap.wrap(piece.expandtabs(4), width=cols, replace_whitespace=False,
+                                    break_on_hyphens=False) or [""]
+            for row in wrapped:
+                if len(current) >= lines_per_page:
+                    pages.append(current)
+                    ends.append(offset)
+                    current = []
+                current.append(row)
+            offset += len(piece) + (1 if index == len(pieces) - 1 else 0)
+        if len(pages) > max_pages:
+            break
+
+    truncated = len(pages) > max_pages
+    if not truncated and current:
+        pages.append(current)
+        ends.append(offset)
+        truncated = len(pages) > max_pages
+    shown = pages[:max_pages]
+    covered = ends[max_pages - 1] if truncated else len(text)
+
+    images = []
+    for number, rows in enumerate(shown, 1):
+        img = Image.new("L", (PAGE_W, PAGE_H), 255)
+        draw = ImageDraw.Draw(img)
+        draw.text((MARGIN, MARGIN), f"{title} - page {number}", font=font, fill=120)
+        y = MARGIN + 2 * LINE_H
+        for row in rows:
+            draw.text((MARGIN, y), row, font=font, fill=0)
+            y += LINE_H
+        buffer = io.BytesIO()
+        img.save(buffer, "PNG", optimize=True)
+        images.append(buffer.getvalue())
+    return images, min(covered, len(text))
+
+
+def _try_pictures(text: str, name: str, media_bytes: int):
+    """Page pictures for a long document, or None when it should go as plain text."""
+    if IMAGE_OVER_CHARS <= 0 or len(text) <= IMAGE_OVER_CHARS or Image is None:
+        return None
+    if not _mostly_latin(text):
+        return None
+    try:
+        images, covered = render_text_pages(text, name, MAX_RENDER_PAGES)
+    except Exception:  # any drawing problem: just send the text instead
+        return None
+    if not images or media_bytes + sum(len(x) for x in images) > MAX_MEDIA_BYTES_PER_MESSAGE:
+        return None
+    return images, covered
+
+
+# ---------------------------------------------------------------
 # Saving
 # ---------------------------------------------------------------
 def folder_size(folder: Path) -> int:
@@ -368,6 +481,17 @@ def process_upload(folder: Path, raw_name: str, data: bytes) -> dict:
     }
 
 
+def save_pasted_text(folder: Path, text: str) -> dict:
+    """A very long typed or pasted message is saved as a text file and attached like an upload."""
+    data = text.encode("utf-8")
+    folder.mkdir(parents=True, exist_ok=True)
+    if folder_size(folder) + len(data) > MAX_FOLDER_BYTES:
+        raise ValueError("The uploads folder is full. Delete some files from workspace/uploads first.")
+    saved = store_bytes(folder, datetime.now().strftime("pasted-text-%Y%m%d-%H%M%S.txt"), data)
+    return {"name": saved.name, "path": f"uploads/{saved.name}", "kind": "text",
+            "size": len(data), "mime": None, "sidecar": None}
+
+
 def delete_upload(workspace: Path, record: dict) -> None:
     for key in ("path", "sidecar"):
         if record.get(key):
@@ -380,7 +504,7 @@ def delete_upload(workspace: Path, record: dict) -> None:
 def build_model_input(user_text: str, records: list, workspace: Path) -> list:
     """The message as a list of blocks: your text first, then each file.
     Text files are wrapped in markers with a random code so a file cannot fake the end of
-    its own content and sneak in 'instructions'."""
+    its own content and sneak in 'instructions'. Long documents become page pictures."""
     boundary = secrets.token_hex(4)
     request = (user_text or "").strip() or DEFAULT_REQUEST
     notes, blocks = [], []
@@ -411,6 +535,28 @@ def build_model_input(user_text: str, records: list, workspace: Path) -> list:
         else:
             text = (workspace / record["sidecar"]).read_text(encoding="utf-8", errors="replace")
             readable = record["sidecar"]
+
+        pictures = _try_pictures(text, record["name"], media_bytes)
+        if pictures is not None:
+            images, covered = pictures
+            media_bytes += sum(len(x) for x in images)
+            more = ""
+            if covered < len(text):
+                more = (f"\n[The pictures cover the first {covered} of {len(text)} characters. To read the "
+                        f"rest, call read_file with path='{readable}' and start={covered}, then keep going "
+                        "with next_start until the end. If the user wants a summary or analysis of the "
+                        "whole file, read all of it first.]")
+            notes.append(f"- {record['name']} (long document, drawn as {len(images)} page picture(s) shown "
+                         f"to you directly; saved as {record['path']})")
+            blocks.append({"type": "text",
+                           "text": f"<<<FILE {boundary}: {record['name']} (page pictures follow)>>>"})
+            for image in images:
+                blocks.append({"type": "image",
+                               "data": base64.b64encode(image).decode("ascii"),
+                               "mime_type": "image/png"})
+            blocks.append({"type": "text", "text": f"<<<END FILE {boundary}>>>{more}"})
+            continue
+
         limit = max(0, min(MAX_INLINE_CHARS_PER_FILE, remaining))
         shown = text[:limit]
         remaining -= len(shown)

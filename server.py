@@ -1,16 +1,26 @@
+import asyncio
+import base64
+import io
 import json
+import os
 import re
 import secrets
+import shutil
+import tempfile
 import threading
+import time
 import urllib.parse
 import uuid
 import webbrowser
-from datetime import datetime
+import zipfile
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 import agent
@@ -20,19 +30,39 @@ HOST = "127.0.0.1"  # this computer only; never change this to 0.0.0.0
 PORT = 8000
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 TOKEN = secrets.token_urlsafe(24)  # new secret every time the server starts
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")  # if set in .env, the page asks for it
 APPROVAL_TIMEOUT_SECONDS = 300  # an unanswered approval counts as "deny"
-MAX_MESSAGE_CHARS = 4000
-MAX_EVENTS = 1000
+INLINE_MESSAGE_CHARS = 4000  # a longer typed or pasted message is saved as a file and attached
+MAX_PASTE_CHARS = 200000  # the longest message you can send at all
+MAX_EVENTS = 5000  # messages are never dropped before this; small log lines are trimmed first
 UPLOADS_DIR = agent.WORKSPACE / "uploads"  # attached files are saved here
+INDEX_FILE = agent.BASE_DIR / "index.html"  # the web page
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}  # shown as pictures in the chat
+TEXT_PREVIEW_SUFFIXES = set(agent.ALLOWED_WRITE_EXTENSIONS) | {".log"}
+PREVIEW_CHARS = 20000
+FILE_LIST_LIMIT = 300
 
 # Saved chats live in a "chats" folder next to this file (one JSON file per chat).
 CHATS_DIR = agent.BASE_DIR / "chats"
 CHATS_DIR.mkdir(exist_ok=True)
-MAX_CHATS = 100  # the oldest chats are deleted beyond this
-MAX_CONTEXT_CHARS = 6000  # how much of an old chat is shown to the model when you continue it
+MAX_CHATS = 500  # the oldest chats are deleted beyond this
+MAX_CONTEXT_CHARS = 24000  # how much of an old chat is shown to the model when you continue it
+MAX_TITLE_CHARS = 80  # longest chat name
 CHAT_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")  # strict: ids become file names
 # Log lines that record something the agent actually did (kept when a chat is summarized for the model).
-ACTION_PREFIXES = ("[tool]", "[ran]", "[fetched]", "[task", "[memory")
+ACTION_PREFIXES = ("[tool]", "[ran]", "[fetched]", "[created]", "[task", "[memory")
+# Log lines that are never shown in the chat, and ones that are kept but hidden.
+NOISE_PREFIXES = ("[waiting for model", "[model replied")
+QUIET_PREFIXES = ("[tool]", "[created]")
+
+# Backup and restore limits.
+MAX_RESTORE_BYTES = 300 * 1024 * 1024
+MAX_RESTORE_UNPACKED = 600 * 1024 * 1024
+MAX_RESTORE_FILE = 50 * 1024 * 1024
+MAX_BACKUP_FILE = 20 * 1024 * 1024
+MAX_BACKUP_WORKSPACE = 150 * 1024 * 1024
+RESTORE_WORKSPACE_EXTENSIONS = set(agent.ALLOWED_WRITE_EXTENSIONS) | {
+    ".docx", ".xlsx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 
 def now_iso() -> str:
@@ -53,21 +83,58 @@ class State:
         self.pending = None  # the approval currently waiting for your click
         self.chat_id = new_chat_id()
         self.chat_created = now_iso()
+        self.chat_title = None  # the name you gave this chat (None = automatic name)
+        self.chat_pinned = False
         self.resume_context = None  # earlier messages of a re-opened chat
         self.pending_uploads = {}  # files attached but not sent yet
         self.last_request = None  # what 'Try again' sends
+        self.approval_seconds = 0.0  # time spent waiting for your clicks during this request
 
 
 state = State()
 save_lock = threading.Lock()
 
 
+def trim_events_locked() -> None:
+    """Keep the list under MAX_EVENTS. Small log lines go first; your messages go last.
+    The caller must already hold state.lock."""
+    excess = len(state.events) - MAX_EVENTS
+    if excess <= 0:
+        return
+    kept = []
+    for e in state.events:
+        if excess > 0 and e.get("type") == "log":
+            excess -= 1
+            continue
+        kept.append(e)
+    if excess > 0:
+        kept = kept[excess:]
+    state.events = kept
+
+
 def push(kind: str, **data) -> None:
     with state.lock:
         state.events.append({"id": state.next_id, "type": kind, **data})
         state.next_id += 1
-        if len(state.events) > MAX_EVENTS:
-            del state.events[: len(state.events) - MAX_EVENTS]
+        trim_events_locked()
+
+
+def web_log(message: str) -> None:
+    """What the agent prints goes to the browser. Technical lines are hidden or kept quietly."""
+    text = str(message).strip()
+    if text.startswith(NOISE_PREFIXES):
+        return
+    push("log", text=message, quiet=text.startswith(QUIET_PREFIXES))
+
+
+def announce_file(path: str) -> None:
+    """The agent created a file: show a Download card (with a preview for pictures) in the chat."""
+    try:
+        size = (agent.WORKSPACE / path).stat().st_size
+    except OSError:
+        size = 0
+    push("file", path=path, name=Path(path).name, size=size,
+         image=Path(path).suffix.lower() in IMAGE_SUFFIXES)
 
 
 # ---------------------------------------------------------------
@@ -102,6 +169,22 @@ def prune_chats(keep_id: str) -> None:
         excess -= 1
 
 
+def write_chat_file(chat_id: str, data: dict) -> None:
+    """Write a chat file atomically. May raise OSError."""
+    with save_lock:
+        path = chat_path(chat_id)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        prune_chats(chat_id)
+
+
+def auto_title(events: list) -> str:
+    first_user = next((e.get("text", "") for e in events if e.get("type") == "user"), "")
+    flat = " ".join(str(first_user).split())
+    return flat[:60] + ("..." if len(flat) > 60 else "")
+
+
 def save_current_chat() -> None:
     """Write the open chat to disk. Never raises: a disk problem must not stop the agent."""
     try:
@@ -109,19 +192,13 @@ def save_current_chat() -> None:
             events = [dict(e) for e in state.events]
             chat_id = state.chat_id
             created = state.chat_created
-        first_user = next((e["text"] for e in events if e["type"] == "user"), None)
-        if first_user is None:
+            custom_title = state.chat_title or ""
+            pinned = state.chat_pinned
+        if not any(e.get("type") == "user" for e in events):
             return  # nothing worth saving yet
-        flat = " ".join(first_user.split())
-        title = flat[:60] + ("..." if len(flat) > 60 else "")
-        data = {"id": chat_id, "title": title, "created": created,
-                "updated": now_iso(), "events": events}
-        with save_lock:
-            path = chat_path(chat_id)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(path)
-            prune_chats(chat_id)
+        data = {"id": chat_id, "title": auto_title(events), "custom_title": custom_title,
+                "pinned": pinned, "created": created, "updated": now_iso(), "events": events}
+        write_chat_file(chat_id, data)
     except OSError as e:
         print(f"  [warning] could not save the chat: {e}")
 
@@ -134,11 +211,41 @@ def list_chats() -> list:
             continue
         items.append({
             "id": path.stem,
-            "title": str(data.get("title") or "(untitled)"),
+            "title": str(data.get("custom_title") or data.get("title") or "(untitled)"),
             "updated": str(data.get("updated") or ""),
+            "pinned": bool(data.get("pinned")),
         })
     items.sort(key=lambda c: c["updated"], reverse=True)
+    items.sort(key=lambda c: not c["pinned"])  # pinned chats first, newest first inside each group
     return items
+
+
+def search_chats(query: str) -> list:
+    """Chats whose title or messages contain the text (case does not matter)."""
+    needle = query.lower()
+    results = []
+    for path in CHATS_DIR.glob("*.json"):
+        data = load_chat(path.stem)
+        if data is None:
+            continue
+        title = str(data.get("custom_title") or data.get("title") or "(untitled)")
+        hits, snippet = 0, ""
+        for e in data["events"]:
+            if not isinstance(e, dict) or e.get("type") not in ("user", "answer"):
+                continue
+            text = str(e.get("text", ""))
+            position = text.lower().find(needle)
+            if position >= 0:
+                hits += 1
+                if not snippet:
+                    start = max(0, position - 40)
+                    piece = text[start:position + len(needle) + 70].replace("\n", " ")
+                    snippet = ("..." if start else "") + piece + "..."
+        if hits or needle in title.lower():
+            results.append({"id": path.stem, "title": title, "snippet": snippet, "hits": hits,
+                            "updated": str(data.get("updated") or ""), "pinned": bool(data.get("pinned"))})
+    results.sort(key=lambda r: r["updated"], reverse=True)
+    return results[:50]
 
 
 def build_context(events: list):
@@ -181,10 +288,31 @@ def reset_chat_locked() -> None:
     """Start an empty chat. The caller must already hold state.lock."""
     state.chat_id = new_chat_id()
     state.chat_created = now_iso()
+    state.chat_title = None
+    state.chat_pinned = False
     state.previous_id = None
     state.resume_context = None
     state.last_request = None
     state.events = []
+
+
+def chat_markdown(events: list) -> str:
+    """A saved chat as Markdown text (used for Export)."""
+    lines = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        kind = e.get("type")
+        if kind == "user":
+            lines += ["## You", "", str(e.get("text", "")), ""]
+            files = [str(f.get("name", "?")) for f in (e.get("files") or []) if isinstance(f, dict)]
+            if files:
+                lines += ["*Attached: " + ", ".join(files) + "*", ""]
+        elif kind == "answer":
+            lines += ["## Agent", "", str(e.get("text", "")), ""]
+        elif kind == "file":
+            lines += [f"*File created: {e.get('name', '')}*", ""]
+    return "\n".join(lines).strip() + "\n"
 
 
 # ---------------------------------------------------------------
@@ -198,8 +326,10 @@ def web_confirm(name: str, args: dict) -> bool:
         state.pending = {"id": approval_id, "decision": None, "event": waiter}
     push("approval", approval_id=approval_id, name=name, text=text)
 
+    waited_from = time.time()
     answered = waiter.wait(timeout=APPROVAL_TIMEOUT_SECONDS)
     with state.lock:
+        state.approval_seconds += time.time() - waited_from
         decision = bool(state.pending["decision"]) if answered else False
         state.pending = None
         outcome = "approved" if decision else ("denied" if answered else "expired")
@@ -225,7 +355,7 @@ def explain(e: Exception) -> str:
     names = [cls.__name__ for cls in type(e).__mro__]
     if "429" in str(e):
         return ("That is a quota or rate limit. Wait a few minutes or try another "
-                "GEMINI_MODEL in .env.")
+                "model from the menu at the top.")
     if agent.is_transient(e):
         return "This looks like a problem with your internet connection. Check it, then press Try again."
     if "APITimeoutError" in names or isinstance(e, TimeoutError) or "timed out" in str(e).lower():
@@ -233,12 +363,19 @@ def explain(e: Exception) -> str:
     return ""
 
 
-def run_request(model_text: str, message: str, use_search: bool) -> None:
+def run_request(model_text, message: str, use_search: bool) -> None:
+    started = time.time()
+    with state.lock:
+        state.approval_seconds = 0.0
     try:
         interaction = agent.ask(model_text, state.previous_id, use_search, user_message=message)
         state.previous_id = interaction.id
         state.resume_context = None  # the old chat has now been shown to the model
-        push("answer", text=interaction.output_text or "(The model returned no text.)")
+        with state.lock:
+            waited = state.approval_seconds
+        seconds = max(0.0, time.time() - started - waited)  # time spent waiting for your clicks is not counted
+        push("answer", text=interaction.output_text or "(The model returned no text.)",
+             regen=True, seconds=round(seconds, 1), ts=time.time())
     except agent.Cancelled:
         push("log", text="  [stopped by you]")
         recover_after_failure()
@@ -252,19 +389,186 @@ def run_request(model_text: str, message: str, use_search: bool) -> None:
 
 
 # ---------------------------------------------------------------
+# Calendar file (.ics) for tasks with a due date
+# ---------------------------------------------------------------
+def _ics_escape(text: str) -> str:
+    return (text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\r", "").replace("\n", "\\n"))
+
+
+def _ics_fold(line: str) -> str:
+    """Calendar lines may be at most 75 bytes: longer ones are continued on the next line."""
+    parts, current = [], ""
+    for ch in line:
+        limit = 75 if not parts else 74
+        if len((current + ch).encode("utf-8")) > limit:
+            parts.append(current)
+            current = ch
+        else:
+            current += ch
+    parts.append(current)
+    return "\r\n ".join(parts)
+
+
+def tasks_ics_text() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//My AI Agent//Tasks//EN", "CALSCALE:GREGORIAN"]
+    for t in agent.list_tasks("open")["tasks"]:
+        if not t.get("due"):
+            continue
+        try:
+            start = date.fromisoformat(t["due"])
+        except ValueError:
+            continue
+        end = start + timedelta(days=1)
+        lines += ["BEGIN:VEVENT", f"UID:task-{t['id']}-{t['due']}@my-ai-agent", f"DTSTAMP:{stamp}",
+                  f"DTSTART;VALUE=DATE:{start:%Y%m%d}", f"DTEND;VALUE=DATE:{end:%Y%m%d}",
+                  f"SUMMARY:{_ics_escape(t['title'])}"]
+        if t.get("repeat") in agent.REPEATS:
+            lines.append(f"RRULE:FREQ={t['repeat'].upper()}")
+        if t.get("priority") == "high":
+            lines.append("PRIORITY:1")
+        elif t.get("priority") == "low":
+            lines.append("PRIORITY:9")
+        lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(_ics_fold(line) for line in lines) + "\r\n"
+
+
+# ---------------------------------------------------------------
+# Backup and restore
+# ---------------------------------------------------------------
+def build_backup(zip_path: Path) -> None:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in CHATS_DIR.glob("*.json"):
+            zf.write(path, "chats/" + path.name)
+        for name in ("tasks.json", "memory.json", "settings.json"):
+            source = agent.BASE_DIR / name
+            if source.exists():
+                zf.write(source, name)
+        total = 0
+        for path in agent.WORKSPACE.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(agent.WORKSPACE).as_posix()
+            if relative.startswith(("uploads/", "snippets/")):
+                continue  # attached originals and temporary code are not part of the backup
+            size = path.stat().st_size
+            if size > MAX_BACKUP_FILE or total + size > MAX_BACKUP_WORKSPACE:
+                continue
+            total += size
+            zf.write(path, "workspace/" + relative)
+
+
+def _valid_task(t) -> bool:
+    return (isinstance(t, dict) and isinstance(t.get("id"), int) and isinstance(t.get("title"), str)
+            and t.get("status") in ("open", "done"))
+
+
+def _valid_note(n) -> bool:
+    return isinstance(n, dict) and isinstance(n.get("id"), int) and isinstance(n.get("fact"), str)
+
+
+def restore_backup(data: bytes) -> str:
+    """Put a backup zip back. Only known file names and types are accepted. Raises ValueError."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("That is not a valid backup file.")
+    infos = [i for i in zf.infolist() if not i.is_dir()]
+    if len(infos) > 6000 or sum(i.file_size for i in infos) > MAX_RESTORE_UNPACKED:
+        raise ValueError("That backup is too large to restore safely.")
+
+    chats = files = 0
+    extras = []
+    for info in infos:
+        name = info.filename
+        parts = name.split("/")
+        if name.startswith("/") or "\\" in name or ".." in parts or ":" in name:
+            continue
+        with zf.open(info) as handle:
+            raw = handle.read(MAX_RESTORE_FILE + 1)  # the real size counts, not the one the file claims
+        if len(raw) > MAX_RESTORE_FILE:
+            continue
+
+        if len(parts) == 2 and parts[0] == "chats" and parts[1].endswith(".json") \
+                and CHAT_ID_RE.match(parts[1][:-5]):
+            try:
+                chat_data = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                continue
+            if isinstance(chat_data, dict) and isinstance(chat_data.get("events"), list):
+                write_chat_file(parts[1][:-5], chat_data)
+                chats += 1
+        elif name in ("tasks.json", "memory.json"):
+            try:
+                items = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                continue
+            if isinstance(items, list):
+                if name == "tasks.json":
+                    agent.save_list(agent.TASKS_FILE, [t for t in items if _valid_task(t)])
+                    extras.append("tasks")
+                else:
+                    agent.save_list(agent.MEMORY_FILE, [n for n in items if _valid_note(n)])
+                    extras.append("notes")
+        elif name == "settings.json":
+            try:
+                saved = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                continue
+            if isinstance(saved, dict):
+                if isinstance(saved.get("instructions"), str):
+                    agent.update_settings({"instructions": saved["instructions"][:agent.MAX_INSTRUCTIONS_CHARS]})
+                if isinstance(saved.get("model"), str) and agent.MODEL_NAME_RE.match(saved["model"]):
+                    agent.set_model(saved["model"])
+                extras.append("settings")
+        elif parts[0] == "workspace" and len(parts) > 1:
+            try:
+                target = agent._safe_path("/".join(parts[1:]))
+            except ValueError:
+                continue
+            if target.suffix.lower() not in RESTORE_WORKSPACE_EXTENSIONS:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            files += 1
+
+    summary = [f"{chats} chats", f"{files} files"] + extras
+    return ", ".join(summary)
+
+
+# ---------------------------------------------------------------
 # The web app
 # ---------------------------------------------------------------
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+def _password_ok(request: Request) -> bool:
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
+    except Exception:
+        return False
+    given = decoded.split(":", 1)[1] if ":" in decoded else ""
+    return secrets.compare_digest(given.encode("utf-8"), APP_PASSWORD.encode("utf-8"))
 
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
     """Only this computer's browser tab that loaded the page may use the API.
     - Host check blocks DNS-rebinding tricks.
+    - The password (if APP_PASSWORD is set) keeps other people using this computer out.
     - The secret token (embedded in the page) blocks other websites from calling the API."""
     host = request.headers.get("host", "")
     if host not in ALLOWED_HOSTS:
         return JSONResponse({"error": "forbidden host"}, status_code=403)
+    if APP_PASSWORD and not _password_ok(request):
+        await asyncio.sleep(1)  # slows down guessing
+        return Response("Password needed", status_code=401,
+                        headers={"WWW-Authenticate": 'Basic realm="My AI Agent"'})
     if request.url.path.startswith("/api/"):
         token = request.headers.get("x-session-token", "")
         if not secrets.compare_digest(token, TOKEN):
@@ -276,6 +580,7 @@ class ChatIn(BaseModel):
     message: str
     use_search: bool = False
     attachments: list[str] = []
+    edit_last: bool = False
 
 
 class ApproveIn(BaseModel):
@@ -283,17 +588,66 @@ class ApproveIn(BaseModel):
     approved: bool
 
 
-@app.get("/", response_class=HTMLResponse)
+class RenameIn(BaseModel):
+    title: str = ""
+
+
+class PinIn(BaseModel):
+    pinned: bool = True
+
+
+class TaskIn(BaseModel):
+    title: str
+    due_date: str | None = None
+    priority: str | None = None
+    repeat: str | None = None
+
+
+class NoteIn(BaseModel):
+    fact: str
+
+
+class ModelIn(BaseModel):
+    model: str
+
+
+class TextIn(BaseModel):
+    text: str = ""
+
+
+class RunIn(BaseModel):
+    code: str
+
+
+@app.get("/")
 def index():
     headers = {
         "Cache-Control": "no-store",
         "X-Frame-Options": "DENY",
         "Content-Security-Policy": (
             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-            "connect-src 'self'; frame-ancestors 'none'"
+            "img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'"
         ),
     }
-    return HTMLResponse(INDEX_HTML.replace("__TOKEN__", TOKEN), headers=headers)
+    try:
+        page = INDEX_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return HTMLResponse("index.html is missing. Put it in the same folder as server.py.",
+                            status_code=500)
+    return HTMLResponse(page.replace("__TOKEN__", TOKEN), headers=headers)
+
+
+def user_name() -> str:
+    """The name for the greeting: USER_NAME from .env, otherwise a saved note like
+    'The user's name is Elder.'"""
+    name = os.getenv("USER_NAME", "").strip()
+    if name:
+        return name[:40]
+    for note in agent.load_memories():
+        found = re.search(r"(?i:\bname is) ([A-Z][\w'-]*)", str(note.get("fact", "")))
+        if found:
+            return found.group(1)[:40]
+    return ""
 
 
 @app.get("/api/state")
@@ -302,21 +656,51 @@ def get_state():
     return {
         "model": agent.MODEL,
         "web_search": agent.ENABLE_WEB_SEARCH,
+        "user_name": user_name(),
         "today": tasks["today"],
         "tasks": tasks["tasks"],
         "notes": agent.load_memories(),
+        "usage": agent.get_usage_today(),
+        "instructions": agent.get_instructions(),
+        "password_on": bool(APP_PASSWORD),
     }
 
 
-class TaskIn(BaseModel):
-    title: str
-    due_date: str | None = None
+# ----- model and instructions -----
+@app.get("/api/models")
+def get_models():
+    return {"current": agent.MODEL, "models": agent.list_models()}
 
 
+@app.post("/api/model")
+def choose_model(body: ModelIn):
+    with state.lock:
+        if state.busy:
+            return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
+    if body.model not in agent.list_models():
+        return JSONResponse({"error": "That model is not in the list."}, status_code=400)
+    result = agent.set_model(body.model)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    with state.lock:  # continue the chat from a written summary instead of the old model's record
+        state.previous_id = None
+        state.resume_context = build_context(state.events)
+    return result
+
+
+@app.post("/api/instructions")
+def save_instructions(body: TextIn):
+    result = agent.set_instructions(body.text)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+# ----- tasks -----
 @app.post("/api/tasks")
 def add_task_button(body: TaskIn):
     try:
-        result = agent.create_task(body.title, body.due_date or None)
+        result = agent.create_task(body.title, body.due_date or None, body.priority, body.repeat)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     if "error" in result:
@@ -340,12 +724,60 @@ def delete_task_button(task_id: int):
     return result
 
 
+@app.get("/api/tasks.ics")
+def tasks_ics():
+    return Response(tasks_ics_text(), media_type="text/calendar",
+                    headers={"Content-Disposition": 'attachment; filename="tasks.ics"'})
+
+
+# ----- notes -----
+@app.post("/api/notes")
+def add_note(body: NoteIn):
+    fact = body.fact.strip()
+    if not fact:
+        return JSONResponse({"error": "The note is empty."}, status_code=400)
+    if len(fact) > agent.MAX_MEMORY_CHARS:
+        return JSONResponse({"error": f"Too long. Keep notes under {agent.MAX_MEMORY_CHARS} characters."},
+                            status_code=400)
+    if agent._looks_secret(fact):
+        return JSONResponse({"error": "Never store passwords, keys, tokens or ID numbers."}, status_code=400)
+    memories = agent.load_memories()
+    if len(memories) >= agent.MAX_MEMORIES:
+        return JSONResponse({"error": "Memory is full. Delete some notes first."}, status_code=400)
+    if any(m["fact"].lower() == fact.lower() for m in memories):
+        return {"status": "already saved"}
+    new_id = max((m["id"] for m in memories), default=0) + 1
+    memories.append({"id": new_id, "fact": fact, "saved": datetime.now().date().isoformat()})
+    agent.save_memories(memories)
+    return {"status": "saved", "id": new_id}
+
+
+@app.put("/api/notes/{note_id}")
+def edit_note(note_id: int, body: NoteIn):
+    result = agent.update_memory(note_id, body.fact)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+@app.delete("/api/notes/{note_id}")
+def delete_note(note_id: int):
+    if not agent.delete_memory(note_id):
+        return JSONResponse({"error": "No such note."}, status_code=404)
+    return {"ok": True}
+
+
+# ----- chat events and chats -----
 @app.get("/api/events")
 def get_events(after: int = 0):
     with state.lock:
         events = [e for e in state.events if e["id"] >= after]
         pending = state.pending["id"] if state.pending else None
-        return {"events": events, "next": state.next_id, "busy": state.busy, "pending": pending}
+        last = state.last_request
+        editable = (last is not None and not state.busy and len(last["message"]) <= INLINE_MESSAGE_CHARS
+                    and any(e.get("type") == "user" for e in state.events))
+        return {"events": events, "next": state.next_id, "busy": state.busy, "pending": pending,
+                "editable": editable}
 
 
 @app.get("/api/chats")
@@ -353,6 +785,176 @@ def get_chats():
     return {"chats": list_chats(), "current": state.chat_id}
 
 
+@app.get("/api/search")
+def search(q: str = ""):
+    query = q.strip()[:100]
+    if len(query) < 2:
+        return {"results": []}
+    return {"results": search_chats(query)}
+
+
+@app.get("/api/chats/{chat_id}/export")
+def export_chat(chat_id: str, format: str = "md"):
+    if not CHAT_ID_RE.match(chat_id):
+        return JSONResponse({"error": "No such chat."}, status_code=404)
+    if format not in ("md", "docx", "pdf"):
+        return JSONResponse({"error": "Choose md, docx or pdf."}, status_code=400)
+    with state.lock:
+        is_current = chat_id == state.chat_id
+        current_events = [dict(e) for e in state.events] if is_current else None
+        custom = state.chat_title or ""
+    if is_current:
+        events = current_events
+        title = custom or auto_title(events)
+    else:
+        data = load_chat(chat_id)
+        if data is None:
+            return JSONResponse({"error": "No such chat."}, status_code=404)
+        events = data["events"]
+        title = str(data.get("custom_title") or data.get("title") or "Chat")
+    if not any(isinstance(e, dict) and e.get("type") == "user" for e in events):
+        return JSONResponse({"error": "There is nothing to export yet."}, status_code=404)
+
+    body_markdown = chat_markdown(events)
+    folder = Path(tempfile.mkdtemp(prefix="agent-export-"))
+    safe = re.sub(r"[^\w .()-]", "_", title).strip(" .")[:50] or "chat"
+    target = folder / f"{safe}.{format}"
+    try:
+        if format == "md":
+            target.write_text(f"# {title}\n\n{body_markdown}", encoding="utf-8")
+        else:
+            import docwriter  # needs python-docx or reportlab
+
+            (docwriter.build_docx if format == "docx" else docwriter.build_pdf)(target, body_markdown, title)
+    except Exception as e:
+        shutil.rmtree(folder, ignore_errors=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return FileResponse(target, filename=target.name,
+                        background=BackgroundTask(shutil.rmtree, str(folder), True))
+
+
+@app.get("/api/download")
+def download_file(path: str):
+    """Send a file from the workspace folder to the browser (Download button and picture previews)."""
+    try:
+        target = agent._safe_path(path)
+    except ValueError:
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    media_type = "image/svg+xml" if target.suffix.lower() == ".svg" else None
+    return FileResponse(target, filename=target.name, media_type=media_type)
+
+
+# ----- workspace files panel -----
+@app.get("/api/files")
+def list_workspace_files():
+    items = []
+    for path in agent.WORKSPACE.rglob("*"):
+        if not path.is_file() or ".tmp." in path.name or path.name.endswith(".tmp"):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        items.append({
+            "path": path.relative_to(agent.WORKSPACE).as_posix(),
+            "name": path.name,
+            "size": stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+        })
+    items.sort(key=lambda f: f["modified"], reverse=True)
+    return {"files": items[:FILE_LIST_LIMIT], "more": len(items) > FILE_LIST_LIMIT}
+
+
+@app.get("/api/files/preview")
+def preview_file(path: str):
+    try:
+        target = agent._safe_path(path)
+    except ValueError:
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    suffix = target.suffix.lower()
+    if suffix in IMAGE_SUFFIXES or suffix == ".bmp":
+        return {"kind": "image"}
+    if suffix == ".pdf":
+        return {"kind": "pdf", "note": "PDF files have no preview here. Use Download."}
+    raw = target.read_bytes()[:3_000_000]
+    if suffix in (".docx", ".xlsx", ".pptx"):
+        try:
+            text = uploads.office_to_text(suffix, target.read_bytes())
+        except ValueError as e:
+            return {"kind": "binary", "note": str(e)}
+    elif suffix in TEXT_PREVIEW_SUFFIXES:
+        text = uploads.decode_text(raw)
+    else:
+        return {"kind": "binary", "note": "No preview for this file type. Use Download."}
+    return {"kind": "text", "text": text[:PREVIEW_CHARS], "truncated": len(text) > PREVIEW_CHARS}
+
+
+@app.delete("/api/files")
+def delete_workspace_file(path: str):
+    try:
+        target = agent._safe_path(path)
+    except ValueError:
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    try:
+        target.unlink()
+    except OSError as e:
+        return JSONResponse({"error": f"Could not delete it: {e}"}, status_code=500)
+    return {"ok": True}
+
+
+# ----- run a code block -----
+@app.post("/api/run")
+def run_code(body: RunIn):
+    result = agent.run_snippet(body.code)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+# ----- backup and restore -----
+@app.get("/api/backup")
+def backup():
+    folder = Path(tempfile.mkdtemp(prefix="agent-backup-"))
+    target = folder / f"agent-backup-{date.today().isoformat()}.zip"
+    try:
+        build_backup(target)
+    except OSError as e:
+        shutil.rmtree(folder, ignore_errors=True)
+        return JSONResponse({"error": f"Could not make the backup: {e}"}, status_code=500)
+    return FileResponse(target, filename=target.name,
+                        background=BackgroundTask(shutil.rmtree, str(folder), True))
+
+
+@app.post("/api/restore")
+async def restore(request: Request):
+    with state.lock:
+        if state.busy:
+            return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_RESTORE_BYTES:
+        return JSONResponse({"error": "That backup file is too big."}, status_code=413)
+    chunks, total = [], 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_RESTORE_BYTES:
+            return JSONResponse({"error": "That backup file is too big."}, status_code=413)
+        chunks.append(chunk)
+    try:
+        summary = await run_in_threadpool(restore_backup, b"".join(chunks))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except OSError as e:
+        return JSONResponse({"error": f"Could not restore: {e}"}, status_code=500)
+    return {"ok": True, "summary": summary}
+
+
+# ----- attachments -----
 @app.post("/api/uploads")
 async def upload_file(request: Request):
     """Receive one file (raw bytes in the body, name in the X-Filename header)."""
@@ -404,7 +1006,7 @@ def remove_upload(upload_id: str):
 
 def build_request_input(visible: str, records: list, context):
     """What is sent to the model: your text (with an old chat's summary if you re-opened one)
-    and any attached files."""
+    and any attached files (long documents are drawn as page pictures)."""
     text_for_model = f"{context}\n\nNew message from the user:\n{visible}" if context else visible
     if records:
         return uploads.build_model_input(text_for_model, records, agent.WORKSPACE)
@@ -415,12 +1017,14 @@ def build_request_input(visible: str, records: list, context):
 def chat(body: ChatIn):
     message = body.message.strip()
     ids = list(dict.fromkeys(body.attachments))  # no duplicates, same order
-    if not message and not ids:
+    if not message and not ids and not body.edit_last:
         return JSONResponse({"error": "Empty message."}, status_code=400)
-    if len(message) > MAX_MESSAGE_CHARS:
-        return JSONResponse({"error": f"Message too long (limit {MAX_MESSAGE_CHARS})."}, status_code=400)
+    if len(message) > MAX_PASTE_CHARS:
+        return JSONResponse({"error": f"Message too long (limit {MAX_PASTE_CHARS} characters). "
+                                       "Attach it as a file instead."}, status_code=400)
     if len(ids) > uploads.MAX_FILES_PER_MESSAGE:
         return JSONResponse({"error": "Too many attached files."}, status_code=400)
+    edit_index = None
     with state.lock:
         if state.busy:
             return JSONResponse({"error": "The agent is still working."}, status_code=409)
@@ -431,10 +1035,38 @@ def chat(body: ChatIn):
                 return JSONResponse({"error": "An attached file is no longer available. Attach it again."},
                                     status_code=400)
             records.append(record)
+        if body.edit_last:
+            last = state.last_request
+            edit_index = next((i for i in range(len(state.events) - 1, -1, -1)
+                               if state.events[i].get("type") == "user"), None)
+            if last is None or edit_index is None:
+                return JSONResponse({"error": "There is nothing to edit."}, status_code=400)
+            if not ids:
+                records = list(last["records"])  # keep the files of the message being edited
+            context = build_context(state.events[:edit_index])
+        else:
+            context = state.resume_context
+        if not message and not records:
+            return JSONResponse({"error": "Empty message."}, status_code=400)
         state.busy = True
-        context = state.resume_context
 
-    visible = message or (uploads.DEFAULT_REQUEST if records else "")
+    if len(message) > INLINE_MESSAGE_CHARS:
+        # Too long to send as a message: save it as a file and attach it (long files become pictures).
+        try:
+            pasted = uploads.save_pasted_text(UPLOADS_DIR, message)
+        except (ValueError, OSError) as e:
+            with state.lock:
+                state.busy = False
+            return JSONResponse({"error": f"Could not save your long text: {e}"}, status_code=400)
+        pasted["id"] = uuid.uuid4().hex[:8]
+        records = [pasted] + records
+        visible = uploads.PASTED_REQUEST
+        flat = " ".join(message.split())
+        shown = flat[:300] + "...\n[Long text: " + str(len(message)) + " characters, attached as a file]"
+    else:
+        visible = message or (uploads.DEFAULT_REQUEST if records else "")
+        shown = visible
+
     try:
         model_input = build_request_input(visible, records, context)
     except ValueError as e:
@@ -445,6 +1077,10 @@ def chat(body: ChatIn):
     with state.lock:
         for record in records:
             state.pending_uploads.pop(record["id"], None)
+        if edit_index is not None:  # remove the old message and everything after it
+            state.events = state.events[:edit_index]
+            state.previous_id = None
+            state.resume_context = context
     use_search = body.use_search and agent.ENABLE_WEB_SEARCH
     state.last_request = {"message": message, "visible": visible, "records": records,
                           "use_search": use_search}
@@ -452,7 +1088,7 @@ def chat(body: ChatIn):
     if records:
         extra["files"] = [{"name": r["name"], "path": r["path"], "kind": r["kind"], "size": r["size"]}
                           for r in records]
-    push("user", text=visible, **extra)
+    push("user", text=shown, **extra)
     save_current_chat()
     threading.Thread(target=run_request, args=(model_input, message, use_search), daemon=True).start()
     return {"ok": True}
@@ -460,7 +1096,7 @@ def chat(body: ChatIn):
 
 @app.post("/api/retry")
 def retry_last():
-    """Send the last message again, with the same attached files."""
+    """Send the last message again (Try again / Regenerate), with the same attached files."""
     with state.lock:
         last = state.last_request
         if last is None:
@@ -536,6 +1172,8 @@ def open_chat(chat_id: str):
             return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
         state.chat_id = chat_id
         state.chat_created = str(data.get("created") or now_iso())
+        state.chat_title = str(data.get("custom_title") or "") or None
+        state.chat_pinned = bool(data.get("pinned"))
         state.previous_id = None
         state.resume_context = build_context(data["events"])
         state.last_request = None
@@ -544,11 +1182,64 @@ def open_chat(chat_id: str):
         for ev in data["events"]:
             if not isinstance(ev, dict) or "type" not in ev:
                 continue
-            clean = {k: v for k, v in ev.items() if k not in ("id", "retry")}
+            clean = {k: v for k, v in ev.items() if k not in ("id", "retry", "regen", "ts")}
+            if clean.get("type") == "log":  # hide technical lines, also in chats saved earlier
+                text = str(clean.get("text", "")).strip()
+                if text.startswith(NOISE_PREFIXES):
+                    continue
+                if text.startswith(QUIET_PREFIXES):
+                    clean["quiet"] = True
             clean["id"] = state.next_id
             state.next_id += 1
             state.events.append(clean)
         return {"after": first}
+
+
+@app.post("/api/chats/{chat_id}/rename")
+def rename_chat(chat_id: str, body: RenameIn):
+    """Give a chat a name of your choice. An empty name goes back to the automatic name."""
+    if not CHAT_ID_RE.match(chat_id):
+        return JSONResponse({"error": "No such chat."}, status_code=404)
+    title = " ".join(body.title.split())[:MAX_TITLE_CHARS]
+    with state.lock:
+        is_current = chat_id == state.chat_id
+        if is_current:
+            state.chat_title = title or None
+    if is_current:
+        save_current_chat()
+        return {"ok": True, "title": title}
+    data = load_chat(chat_id)
+    if data is None:
+        return JSONResponse({"error": "No such chat."}, status_code=404)
+    data["custom_title"] = title
+    try:
+        write_chat_file(chat_id, data)
+    except OSError as e:
+        return JSONResponse({"error": f"Could not save the new name: {e}"}, status_code=500)
+    return {"ok": True, "title": title}
+
+
+@app.post("/api/chats/{chat_id}/pin")
+def pin_chat(chat_id: str, body: PinIn):
+    """Keep a chat at the top of the list (or let it go back to its normal place)."""
+    if not CHAT_ID_RE.match(chat_id):
+        return JSONResponse({"error": "No such chat."}, status_code=404)
+    with state.lock:
+        is_current = chat_id == state.chat_id
+        if is_current:
+            state.chat_pinned = body.pinned
+    if is_current:
+        save_current_chat()
+        return {"ok": True}
+    data = load_chat(chat_id)
+    if data is None:
+        return JSONResponse({"error": "No such chat."}, status_code=404)
+    data["pinned"] = body.pinned
+    try:
+        write_chat_file(chat_id, data)
+    except OSError as e:
+        return JSONResponse({"error": f"Could not save: {e}"}, status_code=500)
+    return {"ok": True}
 
 
 @app.delete("/api/chats/{chat_id}")
@@ -568,594 +1259,15 @@ def delete_chat(chat_id: str):
     return {"ok": True, "reset": reset, "after": after}
 
 
-INDEX_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>My AI Agent</title>
-<style>
-  :root { --bg:#f5f6f8; --panel:#ffffff; --text:#1d2330; --muted:#6b7385; --line:#dfe3ea;
-          --accent:#2f5bea; --user:#e8eeff; --bad:#c0352b; --warn:#fff4d6; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: system-ui, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text);
-         height:100vh; display:flex; flex-direction:column; }
-  header { display:flex; justify-content:space-between; align-items:center; padding:10px 16px;
-           background:var(--panel); border-bottom:1px solid var(--line); gap:12px; flex-wrap:wrap; }
-  .muted { color:var(--muted); font-size:13px; }
-  .row { display:flex; gap:10px; align-items:center; }
-  main { flex:1; display:grid; grid-template-columns: 230px 1fr 280px; grid-template-rows: minmax(0, 1fr);
-         gap:12px; padding:12px; min-height:0; }
-  #chatcol { display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line);
-             border-radius:10px; min-height:0; }
-  #chat { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
-  .bubble { max-width:85%; padding:9px 12px; border-radius:10px; white-space:pre-wrap; word-wrap:break-word;
-            line-height:1.45; border:1px solid var(--line); }
-  .user { align-self:flex-end; background:var(--user); border-color:#cdd8ff; }
-  .agent { align-self:flex-start; background:#fff; }
-  .error { align-self:flex-start; background:#fdecea; border-color:#f3c3be; color:var(--bad); }
-  .log { font-size:12px; color:var(--muted); font-family: Consolas, monospace; white-space:pre-wrap; }
-  .card { align-self:stretch; background:var(--warn); border:1px solid #ecd98a; border-radius:10px; padding:10px 12px; }
-  .cardtitle { font-weight:600; margin-bottom:6px; }
-  pre { background:#f1f3f7; border:1px solid var(--line); border-radius:6px; padding:8px; overflow-x:auto;
-        font-family: Consolas, monospace; font-size:12.5px; margin:6px 0; white-space:pre; }
-  .card pre { max-height:320px; overflow:auto; background:#fffdf5; }
-  code { background:#eef0f5; padding:1px 4px; border-radius:4px; font-family: Consolas, monospace; font-size:12.5px; }
-  #status { padding:4px 14px; min-height:22px; }
-  #composer { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); }
-  textarea { flex:1; resize:none; padding:9px; border:1px solid var(--line); border-radius:8px; font:inherit; }
-  button { border:1px solid var(--line); background:#fff; padding:8px 14px; border-radius:8px; cursor:pointer; font:inherit; }
-  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
-  button.danger { color:var(--bad); }
-  button.wide { width:100%; margin-bottom:10px; }
-  button:disabled { opacity:.5; cursor:default; }
-  aside, nav { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px;
-               overflow-y:auto; min-height:0; }
-  aside h3, nav h3 { margin:4px 0 8px; font-size:14px; }
-  .item { font-size:13px; padding:6px 0; border-bottom:1px solid #eef0f4; }
-  .overdue { color:var(--bad); font-weight:600; }
-  .addtask { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
-  .addtask input { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:8px; font:inherit; font-size:13px; }
-  .addtask .row input { flex:1; min-width:0; width:auto; }
-  .taskrow { display:flex; align-items:flex-start; gap:2px; }
-  .tasklabel { flex:1; min-width:0; word-wrap:break-word; padding-top:2px; }
-  .tick { color:#2e8b57; }
-  .tick:hover { color:#1f6b42; }
-  #attachbar { display:flex; flex-wrap:wrap; gap:6px; padding:0 10px; }
-  #attachbar:not(:empty) { padding-top:8px; }
-  .chip { display:inline-flex; align-items:center; gap:2px; background:#eef0f5; border:1px solid var(--line);
-          border-radius:14px; padding:2px 2px 2px 10px; font-size:12.5px; max-width:280px; }
-  .chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .chip .iconbtn { font-size:16px; padding:0 6px; }
-  #attach { padding:8px 11px; }
-  #chatcol.dragging { outline:2px dashed var(--accent); outline-offset:-6px; }
-  .fileline { margin-top:6px; font-size:12.5px; opacity:.85; }
-  .error .retrybtn { display:block; margin-top:8px; color:var(--text); }
-  .chatitem { display:flex; align-items:center; gap:4px; padding:6px 6px; border-radius:8px; cursor:pointer; }
-  .chatitem:hover { background:#f0f2f7; }
-  .chatitem.current { background:var(--user); }
-  .chatlabel { flex:1; min-width:0; }
-  .chattitle { font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .iconbtn { padding:0 7px; border:none; background:transparent; font-size:18px; color:var(--muted); line-height:1.2; }
-  .iconbtn:hover { color:var(--bad); }
-  @media (max-width: 1100px) {
-    main { grid-template-columns: 200px 1fr; grid-template-rows: minmax(0, 1fr) auto; }
-    aside { grid-column: 1 / -1; max-height: 180px; }
-  }
-  @media (max-width: 700px) {
-    main { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr) auto; }
-    nav { max-height: 150px; }
-  }
-</style>
-</head>
-<body>
-<header>
-  <div><strong>My AI Agent</strong> <span id="model" class="muted"></span></div>
-  <div class="row">
-    <label id="webwrap" class="muted" hidden><input type="checkbox" id="web"> Web search (experimental)</label>
-  </div>
-</header>
-<main>
-  <nav>
-    <button id="newchat" class="primary wide">+ New chat</button>
-    <h3>Chats</h3>
-    <div id="chatlist" class="muted">loading...</div>
-  </nav>
-  <section id="chatcol">
-    <div id="chat"></div>
-    <div id="status" class="muted"></div>
-    <div id="attachbar"></div>
-    <div id="composer">
-      <button id="attach" title="Attach files (or drag them onto the page, or paste a picture)">&#128206;</button>
-      <input type="file" id="fileinput" multiple hidden accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.docx,.xlsx,.pptx,.txt,.md,.csv,.tsv,.json,.xml,.yaml,.yml,.toml,.ini,.log,.py,.js,.ts,.jsx,.tsx,.html,.htm,.css,.php,.sql,.java,.c,.cpp,.h,.cs,.go,.rs,.rb,.kt,.swift">
-      <textarea id="input" rows="2" placeholder="Ask your agent... (Enter to send, Shift+Enter for a new line)"></textarea>
-      <button id="send" class="primary">Send</button>
-      <button id="stop" class="danger" hidden>Stop</button>
-    </div>
-  </section>
-  <aside>
-    <h3>Open tasks</h3>
-    <div class="addtask">
-      <input id="taskTitle" type="text" maxlength="200" placeholder="New task...">
-      <div class="row"><input id="taskDue" type="date" title="Due date (optional)"><button id="taskAdd" class="primary">Add</button></div>
-    </div>
-    <div id="tasks" class="muted">loading...</div>
-    <h3>Saved notes</h3><div id="notes" class="muted">loading...</div>
-  </aside>
-</main>
-<script>
-const TOKEN = "__TOKEN__";
-const chat = document.getElementById("chat");
-const statusEl = document.getElementById("status");
-const input = document.getElementById("input");
-const sendBtn = document.getElementById("send");
-const webBox = document.getElementById("web");
-const stopBtn = document.getElementById("stop");
-let after = 0, busy = false, pendingId = null, lastBusy = false, fatal = "";
-let notice = "", noticeUntil = 0;
-let attachments = [], uploading = 0;
-let busySince = Date.now();
-const MAX_UPLOAD = 10 * 1024 * 1024;
-
-async function api(path, options) {
-  options = options || {};
-  options.headers = { "X-Session-Token": TOKEN, "Content-Type": "application/json" };
-  const res = await fetch(path, options);
-  let data = {};
-  try { data = await res.json(); } catch (e) {}
-  if (!res.ok) {
-    if (res.status === 403) fatal = "Session expired. Reload this page.";
-    throw new Error(data.error || ("HTTP " + res.status));
-  }
-  return data;
-}
-
-function showNotice(message) {
-  notice = message;
-  noticeUntil = Date.now() + 5000;
-  setStatus();
-}
-
-function esc(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function format(text) {
-  let t = esc(text);
-  t = t.replace(/```([\s\S]*?)```/g, function (m, code) {
-    return "<pre>" + code.replace(/^(python|py|js|javascript|html|css|php|sql|json|bash|text)\n/i, "") + "</pre>";
-  });
-  t = t.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-  t = t.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-  return t;
-}
-
-function add(el) {
-  chat.appendChild(el);
-  chat.scrollTop = chat.scrollHeight;
-}
-
-function bubble(cls, html, asText) {
-  const d = document.createElement("div");
-  d.className = "bubble " + cls;
-  if (asText) d.textContent = html; else d.innerHTML = html;
-  add(d);
-}
-
-function approvalCard(ev) {
-  const card = document.createElement("div");
-  card.className = "card";
-  const title = document.createElement("div");
-  title.className = "cardtitle";
-  title.textContent = "Approval needed";
-  const pre = document.createElement("pre");
-  pre.textContent = ev.text;
-  const bar = document.createElement("div");
-  bar.className = "row";
-  card.appendChild(title);
-  card.appendChild(pre);
-  card.appendChild(bar);
-
-  if (ev.decision) {
-    const words = { approved: "You approved this.", denied: "You denied this.", expired: "No answer in time, so it was denied." };
-    bar.textContent = words[ev.decision] || ev.decision;
-  } else if (pendingId === ev.approval_id) {
-    const yes = document.createElement("button");
-    yes.className = "primary";
-    yes.textContent = "Approve";
-    const no = document.createElement("button");
-    no.className = "danger";
-    no.textContent = "Deny";
-    bar.appendChild(yes);
-    bar.appendChild(no);
-    const answer = async function (ok) {
-      yes.disabled = true; no.disabled = true;
-      try {
-        await api("/api/approve", { method: "POST", body: JSON.stringify({ approval_id: ev.approval_id, approved: ok }) });
-        bar.textContent = ok ? "You approved this." : "You denied this.";
-      } catch (e) {
-        bar.textContent = "Could not send your answer: " + e.message;
-      }
-    };
-    yes.onclick = function () { answer(true); };
-    no.onclick = function () { answer(false); };
-  } else {
-    bar.textContent = "(already answered or expired)";
-    bar.className = "muted";
-  }
-  add(card);
-}
-
-function render(ev) {
-  if (ev.type === "user") {
-    const d = document.createElement("div");
-    d.className = "bubble user";
-    d.textContent = ev.text;
-    (ev.files || []).forEach(function (f) {
-      const line = document.createElement("div");
-      line.className = "fileline";
-      line.textContent = "\uD83D\uDCCE " + f.name + " (" + formatSize(f.size) + ")";
-      d.appendChild(line);
-    });
-    add(d);
-  }
-  else if (ev.type === "answer") bubble("agent", format(ev.text), false);
-  else if (ev.type === "error") {
-    const d = document.createElement("div");
-    d.className = "bubble error";
-    d.textContent = "Error: " + ev.text + (ev.hint ? "\n" + ev.hint : "");
-    if (ev.retry) {
-      const b = document.createElement("button");
-      b.className = "retrybtn";
-      b.textContent = "Try again";
-      b.onclick = retryLast;
-      d.appendChild(b);
-    }
-    add(d);
-  }
-  else if (ev.type === "log") {
-    const d = document.createElement("div");
-    d.className = "log";
-    d.textContent = ev.text.trim();
-    add(d);
-  }
-  else if (ev.type === "approval") approvalCard(ev);
-}
-
-function setStatus() {
-  if (fatal) statusEl.textContent = fatal;
-  else if (notice && Date.now() < noticeUntil) statusEl.textContent = notice;
-  else if (pendingId) statusEl.textContent = "Waiting for your approval above...";
-  else if (uploading) statusEl.textContent = "Uploading...";
-  else if (busy) statusEl.textContent = "Working... " + Math.round((Date.now() - busySince) / 1000) + "s (press Stop to cancel)";
-  else statusEl.textContent = "";
-  sendBtn.disabled = busy || uploading > 0;
-  stopBtn.hidden = !busy;
-}
-
-function formatWhen(iso) {
-  try {
-    return new Date(iso).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  } catch (e) { return ""; }
-}
-
-async function loadChats() {
-  try {
-    const d = await api("/api/chats");
-    const list = document.getElementById("chatlist");
-    list.innerHTML = "";
-    if (!d.chats.length) {
-      list.className = "muted";
-      list.textContent = "No saved chats yet.";
-      return;
-    }
-    list.className = "";
-    d.chats.forEach(function (c) {
-      const row = document.createElement("div");
-      row.className = "chatitem" + (c.id === d.current ? " current" : "");
-      const label = document.createElement("div");
-      label.className = "chatlabel";
-      const t = document.createElement("div");
-      t.className = "chattitle";
-      t.textContent = c.title;
-      const when = document.createElement("div");
-      when.className = "muted";
-      when.textContent = formatWhen(c.updated);
-      label.appendChild(t);
-      label.appendChild(when);
-      label.onclick = function () { openChat(c.id); };
-      const del = document.createElement("button");
-      del.className = "iconbtn";
-      del.title = "Delete this chat";
-      del.textContent = "\u00d7";
-      del.onclick = function (e) { e.stopPropagation(); deleteChat(c.id, c.title); };
-      row.appendChild(label);
-      row.appendChild(del);
-      list.appendChild(row);
-    });
-  } catch (e) { /* the polling loop shows connection problems */ }
-}
-
-async function openChat(id) {
-  try {
-    const d = await api("/api/chats/" + id + "/open", { method: "POST", body: "{}" });
-    chat.innerHTML = "";
-    discardAttachments();
-    after = d.after;
-    loadChats();
-  } catch (e) {
-    showNotice(e.message);
-  }
-}
-
-async function deleteChat(id, title) {
-  if (!confirm("Delete the chat \"" + title + "\"? This cannot be undone.")) return;
-  try {
-    const d = await api("/api/chats/" + id, { method: "DELETE" });
-    if (d.reset) { chat.innerHTML = ""; after = d.after; discardAttachments(); }
-    loadChats();
-  } catch (e) {
-    showNotice(e.message);
-  }
-}
-
-async function loadState() {
-  try {
-    const s = await api("/api/state");
-    document.getElementById("model").textContent = "model: " + s.model;
-    document.getElementById("webwrap").hidden = !s.web_search;
-    const tasks = document.getElementById("tasks");
-    tasks.innerHTML = "";
-    if (!s.tasks.length) tasks.textContent = "No open tasks.";
-    s.tasks.forEach(function (t) {
-      const row = document.createElement("div");
-      row.className = "item taskrow" + (t.overdue ? " overdue" : "");
-      const tick = document.createElement("button");
-      tick.className = "iconbtn tick";
-      tick.title = "Mark as done";
-      tick.textContent = "\u2713";
-      tick.onclick = function () { taskAction("/api/tasks/" + t.id + "/complete", "POST"); };
-      const label = document.createElement("div");
-      label.className = "tasklabel";
-      label.textContent = t.title + (t.due ? " (due " + t.due + ")" : "") + (t.overdue ? " - OVERDUE" : "");
-      const del = document.createElement("button");
-      del.className = "iconbtn";
-      del.title = "Delete this task";
-      del.textContent = "\u00d7";
-      del.onclick = function () {
-        if (confirm("Delete this task?\n\n" + t.title)) taskAction("/api/tasks/" + t.id, "DELETE");
-      };
-      row.appendChild(tick);
-      row.appendChild(label);
-      row.appendChild(del);
-      tasks.appendChild(row);
-    });
-    const notes = document.getElementById("notes");
-    notes.innerHTML = "";
-    if (!s.notes.length) notes.textContent = "No saved notes.";
-    s.notes.forEach(function (n) {
-      const d = document.createElement("div");
-      d.className = "item";
-      d.textContent = "[" + n.id + "] " + n.fact;
-      notes.appendChild(d);
-    });
-  } catch (e) { /* the polling loop shows connection problems */ }
-}
-
-async function poll() {
-  while (true) {
-    try {
-      const d = await api("/api/events?after=" + after);
-      pendingId = d.pending;
-      d.events.forEach(render);
-      after = d.next;
-      busy = d.busy;
-      if (busy && !lastBusy) busySince = Date.now();
-      if (lastBusy && !busy) { loadState(); loadChats(); }
-      lastBusy = busy;
-      if (!fatal) setStatus();
-    } catch (e) {
-      statusEl.textContent = fatal || ("Connection problem: " + e.message);
-    }
-    await new Promise(function (r) { setTimeout(r, 700); });
-  }
-}
-
-function formatSize(n) {
-  if (n < 1024) return n + " B";
-  if (n < 1048576) return Math.round(n / 1024) + " KB";
-  return (n / 1048576).toFixed(1) + " MB";
-}
-
-function renderAttachments() {
-  const bar = document.getElementById("attachbar");
-  bar.innerHTML = "";
-  attachments.forEach(function (a) {
-    const chip = document.createElement("div");
-    chip.className = "chip";
-    const label = document.createElement("span");
-    label.textContent = "\uD83D\uDCCE " + a.name + " (" + formatSize(a.size) + ")";
-    label.title = a.name;
-    const x = document.createElement("button");
-    x.className = "iconbtn";
-    x.textContent = "\u00d7";
-    x.title = "Remove";
-    x.onclick = function () { removeAttachment(a.id); };
-    chip.appendChild(label);
-    chip.appendChild(x);
-    bar.appendChild(chip);
-  });
-  setStatus();
-}
-
-async function uploadFile(file) {
-  if (file.size === 0) { showNotice(file.name + " is empty."); return; }
-  if (file.size > MAX_UPLOAD) { showNotice(file.name + " is too big (the limit is 10 MB)."); return; }
-  if (attachments.length + uploading >= 5) { showNotice("You can attach up to 5 files per message."); return; }
-  uploading++;
-  setStatus();
-  try {
-    const res = await fetch("/api/uploads", {
-      method: "POST",
-      headers: { "X-Session-Token": TOKEN, "X-Filename": encodeURIComponent(file.name), "Content-Type": "application/octet-stream" },
-      body: file,
-    });
-    let data = {};
-    try { data = await res.json(); } catch (e) {}
-    if (!res.ok) {
-      if (res.status === 403) fatal = "Session expired. Reload this page.";
-      throw new Error(data.error || ("HTTP " + res.status));
-    }
-    attachments.push({ id: data.id, name: data.name, size: data.size });
-  } catch (e) {
-    showNotice("Could not attach " + file.name + ": " + e.message);
-  } finally {
-    uploading--;
-    renderAttachments();
-  }
-}
-
-async function removeAttachment(id) {
-  attachments = attachments.filter(function (a) { return a.id !== id; });
-  renderAttachments();
-  try { await api("/api/uploads/" + id, { method: "DELETE" }); } catch (e) { /* already gone */ }
-}
-
-function discardAttachments() {
-  attachments.forEach(function (a) { api("/api/uploads/" + a.id, { method: "DELETE" }).catch(function () {}); });
-  attachments = [];
-  renderAttachments();
-}
-
-async function send() {
-  const text = input.value.trim();
-  if ((!text && !attachments.length) || busy || uploading) return;
-  const ids = attachments.map(function (a) { return a.id; });
-  input.value = "";
-  try {
-    await api("/api/chat", { method: "POST", body: JSON.stringify({ message: text, use_search: webBox.checked, attachments: ids }) });
-    attachments = [];
-    renderAttachments();
-    removeRetryButtons();
-    busy = true;
-    busySince = Date.now();
-    setStatus();
-    loadChats();
-  } catch (e) {
-    input.value = text;
-    showNotice("Could not send: " + e.message);
-  }
-}
-
-sendBtn.onclick = send;
-input.addEventListener("keydown", function (e) {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
-});
-document.getElementById("newchat").onclick = async function () {
-  try {
-    const d = await api("/api/new", { method: "POST", body: "{}" });
-    chat.innerHTML = "";
-    discardAttachments();
-    after = d.after;
-    loadChats();
-  } catch (e) {
-    showNotice(e.message);
-  }
-};
-
-async function taskAction(path, method) {
-  try {
-    await api(path, { method: method, body: method === "POST" ? "{}" : undefined });
-    loadState();
-  } catch (e) {
-    showNotice(e.message);
-  }
-}
-
-async function addTask() {
-  const titleBox = document.getElementById("taskTitle");
-  const dueBox = document.getElementById("taskDue");
-  const title = titleBox.value.trim();
-  if (!title) return;
-  try {
-    await api("/api/tasks", { method: "POST", body: JSON.stringify({ title: title, due_date: dueBox.value || null }) });
-    titleBox.value = "";
-    dueBox.value = "";
-    loadState();
-  } catch (e) {
-    showNotice("Could not add the task: " + e.message);
-  }
-}
-
-document.getElementById("taskAdd").onclick = addTask;
-document.getElementById("taskTitle").addEventListener("keydown", function (e) {
-  if (e.key === "Enter") { e.preventDefault(); addTask(); }
-});
-
-const chatCol = document.getElementById("chatcol");
-const fileInput = document.getElementById("fileinput");
-function hasFiles(e) { return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], "Files") !== -1; }
-["dragenter", "dragover"].forEach(function (name) {
-  chatCol.addEventListener(name, function (e) { if (hasFiles(e)) { e.preventDefault(); chatCol.classList.add("dragging"); } });
-});
-["dragleave", "drop"].forEach(function (name) {
-  chatCol.addEventListener(name, function () { chatCol.classList.remove("dragging"); });
-});
-chatCol.addEventListener("drop", function (e) {
-  if (e.dataTransfer && e.dataTransfer.files.length) {
-    e.preventDefault();
-    Array.prototype.forEach.call(e.dataTransfer.files, uploadFile);
-  }
-});
-window.addEventListener("dragover", function (e) { if (hasFiles(e)) e.preventDefault(); });
-window.addEventListener("drop", function (e) { if (hasFiles(e)) e.preventDefault(); });
-input.addEventListener("paste", function (e) {
-  const files = e.clipboardData ? Array.prototype.slice.call(e.clipboardData.files) : [];
-  if (files.length) { e.preventDefault(); files.forEach(uploadFile); }
-});
-document.getElementById("attach").onclick = function () { fileInput.click(); };
-fileInput.onchange = function () {
-  Array.prototype.forEach.call(fileInput.files, uploadFile);
-  fileInput.value = "";
-};
-
-function removeRetryButtons() {
-  Array.prototype.forEach.call(document.querySelectorAll(".retrybtn"), function (b) { b.remove(); });
-}
-
-async function retryLast() {
-  removeRetryButtons();
-  try {
-    await api("/api/retry", { method: "POST", body: "{}" });
-    busy = true;
-    busySince = Date.now();
-    setStatus();
-  } catch (e) {
-    showNotice(e.message);
-  }
-}
-
-stopBtn.onclick = async function () {
-  stopBtn.disabled = true;
-  try { await api("/api/stop", { method: "POST", body: "{}" }); } catch (e) { showNotice(e.message); }
-  stopBtn.disabled = false;
-};
-
-loadState();
-loadChats();
-poll();
-</script>
-</body>
-</html>
-"""
-
-
 def main():
-    agent.LOG_HANDLER = lambda message: push("log", text=message)
+    agent.LOG_HANDLER = web_log
     agent.CONFIRM_HANDLER = web_confirm
+    agent.FILE_HANDLER = announce_file
 
     url = f"http://127.0.0.1:{PORT}"
     print(f"Agent web interface running at {url}")
+    if APP_PASSWORD:
+        print("Password protection is on (the browser will ask for the password).")
     print("Keep this window open. Press Ctrl+C here to stop it.")
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
