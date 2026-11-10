@@ -88,7 +88,8 @@
   #status { padding:4px 14px; min-height:22px; }
   #editbar { display:flex; align-items:center; gap:10px; padding:6px 14px; background:var(--warn);
              border-top:1px solid var(--warn-line); font-size:13px; }
-  #composer { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); }
+  #composer { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); align-items:stretch; }
+  #autosendwrap { display:flex; align-items:center; gap:4px; white-space:nowrap; cursor:pointer; }
   textarea { flex:1; resize:none; padding:9px; border:1px solid var(--line); border-radius:8px; font:inherit;
              background:var(--input-bg); color:var(--text); }
   button { border:1px solid var(--line); background:var(--btn-bg); color:var(--text); padding:8px 14px;
@@ -159,6 +160,26 @@
   .previewimg { max-width:100%; background:#fff; border-radius:6px; }
   .settingsbox textarea { width:100%; min-height:110px; margin-bottom:6px; }
   .settingsbox hr { border:none; border-top:1px solid var(--line); margin:14px 0; }
+  .savedtick { display:inline-flex; align-items:center; gap:6px; color:var(--ok); font-size:13px;
+               font-weight:600; animation: popin .25s ease; }
+  .tickdot { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px;
+             border-radius:50%; background:var(--ok); color:#fff; font-size:12px; line-height:1; }
+  @keyframes popin { from { opacity:0; transform:scale(.8); } to { opacity:1; transform:scale(1); } }
+  /* A long pasted text: a small card with a preview and a PASTED badge. */
+  .userblock { align-self:flex-end; display:flex; flex-direction:column; align-items:flex-end; gap:6px; max-width:85%; }
+  .pastedcard { position:relative; width:230px; max-width:100%; background:var(--pre-bg); border:1px solid var(--line);
+                border-radius:12px; padding:10px 12px 9px; cursor:pointer; text-align:left; }
+  .pastedcard:hover { border-color:var(--muted); }
+  .pastedtext { font-size:11px; line-height:1.5; color:var(--muted); word-break:break-word; overflow:hidden;
+                display:-webkit-box; -webkit-line-clamp:6; line-clamp:6; -webkit-box-orient:vertical; }
+  .pastedtext .kw { color:var(--accent); font-weight:600; }
+  .pastedfoot { margin-top:8px; }
+  .pastedtag { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.6px; color:var(--muted);
+               border:1px solid var(--line); border-radius:5px; padding:0 6px; line-height:1.5; }
+  .pastedx { position:absolute; top:5px; right:5px; width:20px; height:20px; border-radius:50%; padding:0;
+             font-size:14px; line-height:1; background:var(--btn-bg); color:var(--muted);
+             border:1px solid var(--line); display:flex; align-items:center; justify-content:center; }
+  .pastedx:hover { color:var(--bad); }
   @media (max-width: 1100px) {
     main { grid-template-columns: 200px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
     aside { grid-column: 1 / -1; max-height: 260px; }
@@ -193,6 +214,7 @@
         <option value="dark">Dark</option>
       </select>
     </label>
+    <button id="logout" class="small" hidden title="Sign out of the agent">Log out</button>
   </div>
 </header>
 <main>
@@ -229,7 +251,8 @@
     <div id="composer">
       <button id="attach" title="Attach files (or drag them onto the page, or paste a picture)">&#128206;</button>
       <input type="file" id="fileinput" multiple hidden accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.docx,.xlsx,.pptx,.txt,.md,.csv,.tsv,.json,.xml,.yaml,.yml,.toml,.ini,.log,.py,.js,.ts,.jsx,.tsx,.html,.htm,.css,.php,.sql,.java,.c,.cpp,.h,.cs,.go,.rs,.rb,.kt,.swift">
-      <button id="mic" title="Speak your message" hidden>&#127908;</button>
+      <button id="mic" title="Speak your message: click, talk, then pause (or click again)" hidden>&#127908;</button>
+      <label id="autosendwrap" class="muted" hidden title="Send the message automatically as soon as your speech has been turned into text"><input type="checkbox" id="autosend" checked> Auto-send</label>
       <textarea id="input" rows="2" placeholder="Ask your agent... (Enter to send, Shift+Enter for a new line)"></textarea>
       <button id="send" class="primary">Send</button>
       <button id="stop" class="danger" hidden>Stop</button>
@@ -281,7 +304,10 @@
       <h3>Your own instructions</h3>
       <div class="muted">Tell the agent how you like answers: tone, length, language. Saved between sessions.</div>
       <textarea id="instr" class="field" maxlength="1500" placeholder="For example: Keep answers short. Explain code step by step."></textarea>
-      <button id="instrSave" class="primary small">Save instructions</button>
+      <div class="row">
+        <button id="instrSave" class="primary small">Save instructions</button>
+        <span id="instrSaved" class="savedtick" role="status" hidden><span class="tickdot">&#10003;</span> Saved</span>
+      </div>
       <hr>
       <h3>Backup</h3>
       <div class="muted">Saves your chats, tasks, notes, settings and created files in one zip file.</div>
@@ -315,6 +341,7 @@ const TOKEN = "__TOKEN__";
 const $ = function (id) { return document.getElementById(id); };
 const chat = $("chat"), statusEl = $("status"), input = $("input"), sendBtn = $("send");
 const webBox = $("web"), stopBtn = $("stop"), themeSelect = $("theme");
+const DEFAULT_PLACEHOLDER = input.placeholder;
 let after = 0, busy = false, pendingId = null, lastBusy = false, fatal = "";
 let notice = "", noticeUntil = 0;
 let attachments = [], uploading = 0;
@@ -322,8 +349,14 @@ let busySince = Date.now();
 let userName = "", firstPollDone = false, taskLine = "";
 let currentChatId = "", lastUserEl = null, lastUserText = "", editable = false, editing = false;
 let searchTimer = null;
+let savedTimer = null;
+let voiceState = "";  // "", "listening" or "transcribing"
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const TABS = ["tasks", "notes", "files", "settings"];
+// A paste longer than this becomes a "PASTED" card instead of filling the message box.
+const PASTE_MIN_CHARS = 1500, PASTE_MIN_LINES = 25;
+const CODE_HINT_RE = /[{};=<>]|\bimport\b|\bdef\b|\bfunction\b/;
+const KEYWORD_RE = /\b(import|from|def|class|return|const|let|var|function|async|await|public|private|static|void|SELECT)\b/g;
 
 // ---------- theme ----------
 function applyTheme() {
@@ -352,6 +385,10 @@ async function api(path, options) {
   const res = await fetch(path, options);
   let data = {};
   try { data = await res.json(); } catch (e) {}
+  if (res.status === 401) {  // signed out (for example the server was restarted)
+    location.href = "/login";
+    throw new Error("Please sign in again.");
+  }
   if (!res.ok) {
     if (res.status === 403) fatal = "Session expired. Reload this page.";
     throw new Error(data.error || ("HTTP " + res.status));
@@ -361,7 +398,7 @@ async function api(path, options) {
 
 function showNotice(message) {
   notice = message;
-  noticeUntil = Date.now() + 5000;
+  noticeUntil = Date.now() + 8000;
   setStatus();
 }
 
@@ -385,6 +422,7 @@ function formatWhen(iso) {
 
 async function loadBlobUrl(path) {
   const res = await fetch("/api/download?path=" + encodeURIComponent(path), { headers: { "X-Session-Token": TOKEN } });
+  if (res.status === 401) { location.href = "/login"; throw new Error("Please sign in again."); }
   if (!res.ok) throw new Error(res.status === 404 ? "That file no longer exists." : "HTTP " + res.status);
   let blob = await res.blob();
   if (/\.svg$/i.test(path)) blob = new Blob([blob], { type: "image/svg+xml" });
@@ -394,6 +432,7 @@ async function loadBlobUrl(path) {
 async function downloadFromApi(url, fallbackName) {
   try {
     const res = await fetch(url, { headers: { "X-Session-Token": TOKEN } });
+    if (res.status === 401) { location.href = "/login"; return; }
     if (!res.ok) {
       let msg = "HTTP " + res.status;
       try { const j = await res.json(); if (j.error) msg = j.error; } catch (e) {}
@@ -669,6 +708,52 @@ function renderMarkdown(text) {
   return root;
 }
 
+// ---------- pasted-text cards ----------
+// The preview text of a card; in code, words like import, def and function are highlighted.
+function fillPreview(el, text) {
+  text = text || "";
+  if (!CODE_HINT_RE.test(text)) { el.textContent = text; return; }
+  let last = 0, m;
+  KEYWORD_RE.lastIndex = 0;
+  while ((m = KEYWORD_RE.exec(text)) !== null) {
+    if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const k = document.createElement("span");
+    k.className = "kw";
+    k.textContent = m[0];
+    el.appendChild(k);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) el.appendChild(document.createTextNode(text.slice(last)));
+}
+
+// onOpen: click on the card (shows the full text). onRemove: the little x (only before sending).
+function pastedCard(preview, title, onOpen, onRemove) {
+  const card = document.createElement("div");
+  card.className = "pastedcard";
+  card.title = title ? title + " (click to view)" : "Pasted text (click to view)";
+  const body = document.createElement("div");
+  body.className = "pastedtext";
+  fillPreview(body, preview);
+  const foot = document.createElement("div");
+  foot.className = "pastedfoot";
+  const tag = document.createElement("span");
+  tag.className = "pastedtag";
+  tag.textContent = "PASTED";
+  foot.appendChild(tag);
+  card.appendChild(body);
+  card.appendChild(foot);
+  if (onOpen) card.onclick = onOpen;
+  if (onRemove) {
+    const x = document.createElement("button");
+    x.className = "pastedx";
+    x.textContent = "\u00d7";
+    x.title = "Remove";
+    x.onclick = function (e) { e.stopPropagation(); onRemove(); };
+    card.appendChild(x);
+  }
+  return card;
+}
+
 // ---------- greeting and chat view ----------
 function greetingFor(hour) {
   if (hour >= 5 && hour < 12) return "Good morning";
@@ -706,18 +791,31 @@ function clearChatView() {
 }
 
 function userBubble(ev) {
-  const d = document.createElement("div");
-  d.className = "bubble user";
-  d.textContent = ev.text;
-  (ev.files || []).forEach(function (f) {
+  const files = ev.files || [];
+  const pasted = files.filter(function (f) { return f.pasted; });
+  const others = files.filter(function (f) { return !f.pasted; });
+  const bubble = document.createElement("div");
+  bubble.className = "bubble user";
+  bubble.textContent = ev.text || "";
+  others.forEach(function (f) {
     const line = document.createElement("div");
     line.className = "fileline";
     line.textContent = "\uD83D\uDCCE " + f.name + " (" + formatSize(f.size) + ")";
-    d.appendChild(line);
+    bubble.appendChild(line);
   });
-  lastUserEl = d;
-  lastUserText = ev.text;
-  add(d);
+  const hasBubble = !!((ev.text || "").trim() || others.length);
+  let top = bubble;
+  if (pasted.length) {  // pasted cards above the message, like a chat attachment
+    top = document.createElement("div");
+    top.className = "userblock";
+    pasted.forEach(function (f) {
+      top.appendChild(pastedCard(f.preview, f.name, function () { openPreview(f); }, null));
+    });
+    if (hasBubble) top.appendChild(bubble);
+  }
+  lastUserEl = top;
+  lastUserText = ev.text || "";
+  add(top);
 }
 
 function updateEditButton() {
@@ -902,6 +1000,8 @@ function render(ev) {
 function setStatus() {
   if (fatal) statusEl.textContent = fatal;
   else if (notice && Date.now() < noticeUntil) statusEl.textContent = notice;
+  else if (voiceState === "listening") statusEl.textContent = "Listening... speak now. It stops by itself after a pause, or click the microphone again.";
+  else if (voiceState === "transcribing") statusEl.textContent = "Turning your speech into text...";
   else if (pendingId) statusEl.textContent = "Waiting for your approval above...";
   else if (uploading) statusEl.textContent = "Uploading...";
   else if (busy) statusEl.textContent = "Working... " + Math.round((Date.now() - busySince) / 1000) + "s (press Stop to cancel)";
@@ -1094,6 +1194,11 @@ $("newchat").onclick = async function () {
   }
 };
 
+$("logout").onclick = async function () {
+  try { await api("/api/logout", { method: "POST", body: "{}" }); } catch (e) { /* sign-in page follows anyway */ }
+  location.href = "/login";
+};
+
 // ---------- models and usage ----------
 async function loadModels() {
   try {
@@ -1235,13 +1340,16 @@ async function loadState() {
     taskLine = parts.join(" \u00b7 ");
     updateGreeting();
     $("webwrap").hidden = !s.web_search;
+    $("logout").hidden = !s.login_on;
     $("usage").textContent = "Today: " + s.usage.requests + (s.usage.requests === 1 ? " request" : " requests") +
       (s.usage.images ? " \u00b7 " + s.usage.images + (s.usage.images === 1 ? " picture" : " pictures") : "");
     if (document.activeElement !== $("instr")) $("instr").value = s.instructions || "";
     $("settingsInfo").textContent =
-      "Password protection: " + (s.password_on ? "on." : "off (set APP_PASSWORD in .env to turn it on).") +
+      (s.login_on
+        ? "Sign-in: you are asked for your username and password every time the server starts. Change them by running: python server.py --set-login."
+        : "Sign-in is off (REQUIRE_LOGIN=false in .env).") +
       " The model you pick at the top is remembered and wins over GEMINI_MODEL in .env." +
-      " Voice input uses your browser's speech service (in Chrome and Edge it sends the audio to the browser maker for recognition)." +
+      " Voice input records on your computer and sends the recording to Gemini (using your API key) to turn it into text." +
       " For a morning notification run: python reminder.py --install 08:00";
     renderTasks(s);
     renderNotes(s);
@@ -1297,13 +1405,34 @@ $("noteText").addEventListener("keydown", function (e) {
   if (e.key === "Enter") { e.preventDefault(); addNote(); }
 });
 
+// The green "Saved" tick next to the Save instructions button.
+function hideSavedTick() {
+  clearTimeout(savedTimer);
+  $("instrSaved").hidden = true;
+}
+
+function showSavedTick() {
+  const tick = $("instrSaved");
+  tick.hidden = true;
+  void tick.offsetWidth;  // lets the pop-in animation play again on a second save
+  tick.hidden = false;
+  clearTimeout(savedTimer);
+  savedTimer = setTimeout(function () { tick.hidden = true; }, 3000);
+}
+
+$("instr").addEventListener("input", hideSavedTick);  // changed after saving: it is no longer "Saved"
+
 $("instrSave").onclick = async function () {
+  const btn = $("instrSave");
+  btn.disabled = true;
+  hideSavedTick();
   try {
     await api("/api/instructions", { method: "POST", body: JSON.stringify({ text: $("instr").value }) });
-    showNotice("Instructions saved.");
+    showSavedTick();
   } catch (e) {
     showNotice("Could not save: " + e.message);
   }
+  btn.disabled = false;
 };
 
 $("backupBtn").onclick = function () { downloadFromApi("/api/backup", "agent-backup.zip"); };
@@ -1321,6 +1450,7 @@ $("restoreFile").onchange = async function () {
     });
     let data = {};
     try { data = await res.json(); } catch (e) {}
+    if (res.status === 401) { location.href = "/login"; return; }
     if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
     showNotice("Restored: " + data.summary + ". Reloading...");
     setTimeout(function () { location.reload(); }, 1500);
@@ -1462,6 +1592,12 @@ function renderAttachments() {
   const bar = $("attachbar");
   bar.innerHTML = "";
   attachments.forEach(function (a) {
+    if (a.pasted) {  // a long pasted text: a card with a preview and a PASTED badge
+      bar.appendChild(pastedCard(a.preview, a.name,
+        function () { openPreview({ path: a.path, name: a.name }); },
+        function () { removeAttachment(a.id); }));
+      return;
+    }
     const chip = document.createElement("div");
     chip.className = "chip";
     const label = document.createElement("span");
@@ -1479,7 +1615,8 @@ function renderAttachments() {
   setStatus();
 }
 
-async function uploadFile(file) {
+// pasted === true: the file is a text pasted into the message box (shown as a PASTED card).
+async function uploadFile(file, pasted) {
   if (file.size === 0) { showNotice(file.name + " is empty."); return; }
   if (file.size > MAX_UPLOAD) { showNotice(file.name + " is too big (the limit is 10 MB)."); return; }
   if (attachments.length + uploading >= 5) { showNotice("You can attach up to 5 files per message."); return; }
@@ -1488,22 +1625,36 @@ async function uploadFile(file) {
   try {
     const res = await fetch("/api/uploads", {
       method: "POST",
-      headers: { "X-Session-Token": TOKEN, "X-Filename": encodeURIComponent(file.name), "Content-Type": "application/octet-stream" },
+      headers: { "X-Session-Token": TOKEN, "X-Filename": encodeURIComponent(file.name),
+                 "X-Pasted": pasted === true ? "1" : "0", "Content-Type": "application/octet-stream" },
       body: file,
     });
     let data = {};
     try { data = await res.json(); } catch (e) {}
+    if (res.status === 401) { location.href = "/login"; return; }
     if (!res.ok) {
       if (res.status === 403) fatal = "Session expired. Reload this page.";
       throw new Error(data.error || ("HTTP " + res.status));
     }
-    attachments.push({ id: data.id, name: data.name, size: data.size });
+    attachments.push({ id: data.id, name: data.name, size: data.size, path: data.path,
+                       pasted: !!data.pasted, preview: data.preview || "" });
   } catch (e) {
     showNotice("Could not attach " + file.name + ": " + e.message);
   } finally {
     uploading--;
     renderAttachments();
   }
+}
+
+function pastedFileName() {
+  const d = new Date();
+  const p = function (n) { return String(n).padStart(2, "0"); };
+  return "pasted-text-" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" +
+         p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + ".txt";
+}
+
+function addPastedText(text) {
+  uploadFile(new File([text], pastedFileName(), { type: "text/plain" }), true);
 }
 
 async function removeAttachment(id) {
@@ -1589,47 +1740,209 @@ function hasFiles(e) { return e.dataTransfer && Array.prototype.indexOf.call(e.d
 chatCol.addEventListener("drop", function (e) {
   if (e.dataTransfer && e.dataTransfer.files.length) {
     e.preventDefault();
-    Array.prototype.forEach.call(e.dataTransfer.files, uploadFile);
+    Array.prototype.forEach.call(e.dataTransfer.files, function (f) { uploadFile(f); });
   }
 });
 window.addEventListener("dragover", function (e) { if (hasFiles(e)) e.preventDefault(); });
 window.addEventListener("drop", function (e) { if (hasFiles(e)) e.preventDefault(); });
 input.addEventListener("paste", function (e) {
-  const files = e.clipboardData ? Array.prototype.slice.call(e.clipboardData.files) : [];
-  if (files.length) { e.preventDefault(); files.forEach(uploadFile); }
+  const clip = e.clipboardData;
+  const files = clip ? Array.prototype.slice.call(clip.files) : [];
+  if (files.length) {  // a copied picture or file
+    e.preventDefault();
+    files.forEach(function (f) { uploadFile(f); });
+    return;
+  }
+  const text = clip ? clip.getData("text/plain") : "";
+  if (text && (text.length > PASTE_MIN_CHARS || text.split("\n").length > PASTE_MIN_LINES)) {
+    e.preventDefault();  // a long text becomes a PASTED card instead of filling the box
+    addPastedText(text);
+  }
 });
 $("attach").onclick = function () { fileInput.click(); };
 fileInput.onchange = function () {
-  Array.prototype.forEach.call(fileInput.files, uploadFile);
+  Array.prototype.forEach.call(fileInput.files, function (f) { uploadFile(f); });
   fileInput.value = "";
 };
 
-// ---------- voice input ----------
-const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-if (SpeechRec) {
-  $("mic").hidden = false;
-  let rec = null, listening = false;
-  $("mic").onclick = function () {
-    if (listening && rec) { rec.stop(); return; }
-    rec = new SpeechRec();
-    rec.lang = navigator.language || "en-US";
-    rec.interimResults = true;
-    rec.continuous = false;
-    const base = input.value ? input.value.replace(/\s+$/, "") + " " : "";
-    rec.onresult = function (e) {
-      let text = "";
-      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
-      input.value = base + text;
+// ---------- voice input: recorded on this computer, turned into text by Gemini ----------
+const voice = { active: false, stream: null, ctx: null, source: null, proc: null, chunks: [],
+                heard: false, maxRms: 0, lastLoud: 0, startedAt: 0, base: "" };
+
+function voiceSupported() {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
+            (window.AudioContext || window.webkitAudioContext));
+}
+
+function micErrorText(e) {
+  const name = e && e.name;
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return "The microphone is blocked. Click the lock icon in the address bar, allow the microphone for this page, then try again.";
+  }
+  if (name === "NotFoundError" || name === "OverconstrainedError") {
+    return "No microphone was found. Plug one in and try again.";
+  }
+  if (name === "NotReadableError" || name === "AbortError") {
+    return "The microphone is busy. Close other apps that are using it and try again.";
+  }
+  return "Could not start the microphone" + (e && e.message ? " (" + e.message + ")" : "") + ".";
+}
+
+function downsample(buffer, from, to) {
+  if (from === to) return buffer;
+  const ratio = from / to;
+  const length = Math.floor(buffer.length / ratio);
+  const out = new Float32Array(length);
+  for (let i = 0; i < length; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(Math.floor((i + 1) * ratio), buffer.length);
+    let sum = 0, n = 0;
+    for (let j = start; j < end; j++) { sum += buffer[j]; n++; }
+    out[i] = n ? sum / n : 0;
+  }
+  return out;
+}
+
+function encodeWav(samples, rate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  function text(offset, s) { for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i)); }
+  text(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  text(8, "WAVE");
+  text(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);        // PCM
+  view.setUint16(22, 1, true);        // mono
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  text(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+  return new Blob([view], { type: "audio/wav" });
+}
+
+async function startVoice() {
+  if (voice.active || voiceState) return;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch (e) {
+    showNotice(micErrorText(e));
+    return;
+  }
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AC();
+    if (ctx.state === "suspended") await ctx.resume();
+    const source = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    voice.stream = stream; voice.ctx = ctx; voice.source = source; voice.proc = proc;
+    voice.chunks = []; voice.heard = false; voice.maxRms = 0;
+    voice.startedAt = Date.now(); voice.lastLoud = Date.now(); voice.base = input.value;
+    voice.active = true;
+    proc.onaudioprocess = function (ev) {
+      if (!voice.active) return;
+      const data = ev.inputBuffer.getChannelData(0);
+      voice.chunks.push(new Float32Array(data));
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+      const rms = Math.sqrt(sum / data.length);
+      const now = Date.now();
+      if (rms > voice.maxRms) voice.maxRms = rms;
+      if (rms > 0.012) { voice.heard = true; voice.lastLoud = now; }
+      if (voice.heard && now - voice.lastLoud > 2000) stopVoice();             // you paused: done
+      else if (!voice.heard && now - voice.startedAt > 8000) stopVoice();      // nothing heard
+      else if (now - voice.startedAt > 120000) stopVoice();                    // 2 minutes at most
     };
-    rec.onend = function () { listening = false; $("mic").classList.remove("on"); };
-    rec.onerror = function (e) { showNotice("Voice input: " + e.error); };
-    try {
-      rec.start();
-      listening = true;
-      $("mic").classList.add("on");
-    } catch (e) {
-      showNotice("Could not start voice input.");
+    source.connect(proc);
+    proc.connect(ctx.destination);  // silent: nothing is written to the output
+    voiceState = "listening";
+    $("mic").classList.add("on");
+    input.placeholder = "Listening... speak now";
+    setStatus();
+  } catch (e) {
+    stream.getTracks().forEach(function (t) { t.stop(); });
+    showNotice("Could not start recording: " + e.message);
+  }
+}
+
+async function stopVoice() {
+  if (!voice.active) return;
+  voice.active = false;
+  const rate = voice.ctx.sampleRate;
+  try { voice.proc.disconnect(); voice.source.disconnect(); } catch (e) {}
+  if (voice.stream) voice.stream.getTracks().forEach(function (t) { t.stop(); });
+  try { await voice.ctx.close(); } catch (e) {}
+  $("mic").classList.remove("on");
+  input.placeholder = DEFAULT_PLACEHOLDER;
+  const chunks = voice.chunks;
+  voice.chunks = [];
+  if (!voice.heard && voice.maxRms < 0.004) {
+    voiceState = "";
+    setStatus();
+    showNotice("I did not hear anything. Check that the right microphone is selected, then try again.");
+    return;
+  }
+  voiceState = "transcribing";
+  setStatus();
+  try {
+    let total = 0;
+    chunks.forEach(function (c) { total += c.length; });
+    const all = new Float32Array(total);
+    let offset = 0;
+    chunks.forEach(function (c) { all.set(c, offset); offset += c.length; });
+    const wav = encodeWav(downsample(all, rate, 16000), 16000);
+    const res = await fetch("/api/transcribe", {
+      method: "POST",
+      headers: { "X-Session-Token": TOKEN, "Content-Type": "audio/wav" },
+      body: wav,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (res.status === 401) { location.href = "/login"; return; }
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    const text = (data.text || "").trim();
+    if (!text) {
+      showNotice("I could not make out any words. Try again, a little closer to the microphone.");
+      return;
     }
+    input.value = voice.base ? voice.base.replace(/\s+$/, "") + " " + text : text;
+    if ($("autosend").checked) {
+      if (!busy && !uploading) {
+        voiceState = "";
+        await send();
+      } else {
+        showNotice("Your words are in the box. Press Send when the agent is free.");
+      }
+    } else {
+      input.focus();
+    }
+  } catch (e) {
+    showNotice("Voice input: " + e.message);
+  } finally {
+    voiceState = "";
+    setStatus();
+  }
+}
+
+if (voiceSupported()) {
+  $("mic").hidden = false;
+  $("autosendwrap").hidden = false;
+  try { $("autosend").checked = localStorage.getItem("autosend") !== "off"; } catch (e) {}
+  $("autosend").onchange = function () {
+    try { localStorage.setItem("autosend", $("autosend").checked ? "on" : "off"); } catch (e) {}
+  };
+  $("mic").onclick = function () {
+    if (voice.active) stopVoice();
+    else startVoice();
   };
 }
 

@@ -1,11 +1,14 @@
 import asyncio
-import base64
+import getpass
+import hashlib
+import hmac
 import io
 import json
 import os
 import re
 import secrets
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -18,7 +21,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -30,17 +33,23 @@ HOST = "127.0.0.1"  # this computer only; never change this to 0.0.0.0
 PORT = 8000
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 TOKEN = secrets.token_urlsafe(24)  # new secret every time the server starts
-APP_PASSWORD = os.getenv("APP_PASSWORD", "")  # if set in .env, the page asks for it
 APPROVAL_TIMEOUT_SECONDS = 300  # an unanswered approval counts as "deny"
 INLINE_MESSAGE_CHARS = 4000  # a longer typed or pasted message is saved as a file and attached
+PASTE_PREVIEW_CHARS = 220  # how much of a pasted text is shown on its card
 MAX_PASTE_CHARS = 200000  # the longest message you can send at all
 MAX_EVENTS = 5000  # messages are never dropped before this; small log lines are trimmed first
+MAX_AUDIO_BYTES = 8 * 1024 * 1024  # the longest voice recording that is accepted
 UPLOADS_DIR = agent.WORKSPACE / "uploads"  # attached files are saved here
 INDEX_FILE = agent.BASE_DIR / "index.html"  # the web page
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}  # shown as pictures in the chat
 TEXT_PREVIEW_SUFFIXES = set(agent.ALLOWED_WRITE_EXTENSIONS) | {".log"}
 PREVIEW_CHARS = 20000
 FILE_LIST_LIMIT = 300
+
+# Typing one of these as a message (right after a failure) means "Try again": the agent continues
+# where it stopped instead of starting the task from the beginning.
+RETRY_WORDS = re.compile(
+    r"^\s*(retry|try again|again|continue|go on|carry on|resume|proceed|keep going)\s*[.!]*\s*$", re.I)
 
 # Saved chats live in a "chats" folder next to this file (one JSON file per chat).
 CHATS_DIR = agent.BASE_DIR / "chats"
@@ -64,6 +73,28 @@ MAX_BACKUP_WORKSPACE = 150 * 1024 * 1024
 RESTORE_WORKSPACE_EXTENSIONS = set(agent.ALLOWED_WRITE_EXTENSIONS) | {
     ".docx", ".xlsx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
+# Sign-in. Every time the server starts, all earlier sign-ins stop working, so the page always
+# asks for your username and password again. (Set REQUIRE_LOGIN=false in .env to switch it off.)
+REQUIRE_LOGIN = os.getenv("REQUIRE_LOGIN", "true").strip().lower() != "false"
+AUTH_FILE = agent.BASE_DIR / "auth.json"
+SESSION_COOKIE = "agent_session"
+SESSION_HOURS = 12
+MAX_FAILED_LOGINS = 5
+LOCKOUT_SECONDS = 300
+CREDENTIALS = None  # filled in by main(): {"username": ..., "salt": ..., "hash": ...}
+SESSIONS: dict = {}
+FAILED_LOGINS: list = []
+AUTH_LOCK = threading.Lock()
+
+PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'"
+    ),
+}
+
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
@@ -71,6 +102,95 @@ def now_iso() -> str:
 
 def new_chat_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+
+
+def make_preview(text: str) -> str:
+    """The short piece of a pasted text that is shown on its card in the chat."""
+    flat = " ".join(str(text).split())
+    return flat[:PASTE_PREVIEW_CHARS] + ("..." if len(flat) > PASTE_PREVIEW_CHARS else "")
+
+
+# ---------------------------------------------------------------
+# Sign-in
+# ---------------------------------------------------------------
+def _hash_password(password: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+
+
+def make_credentials(username: str, password: str) -> dict:
+    salt = os.urandom(16)
+    return {"username": username, "salt": salt.hex(), "hash": _hash_password(password, salt).hex()}
+
+
+def save_credentials(creds: dict) -> None:
+    tmp = AUTH_FILE.with_name(AUTH_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(creds), encoding="utf-8")
+    tmp.replace(AUTH_FILE)
+
+
+def load_credentials():
+    """The saved login (auth.json), or one made from APP_USERNAME and APP_PASSWORD in .env."""
+    try:
+        data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and all(isinstance(data.get(k), str) and data.get(k)
+                                          for k in ("username", "salt", "hash")):
+            bytes.fromhex(data["salt"])
+            bytes.fromhex(data["hash"])
+            return data
+    except (OSError, ValueError):
+        pass
+    username = os.getenv("APP_USERNAME", "").strip()
+    password = os.getenv("APP_PASSWORD", "")
+    if username and password:
+        return make_credentials(username, password)
+    return None
+
+
+def create_login_interactively() -> dict:
+    if not sys.stdin or not sys.stdin.isatty():
+        raise SystemExit("No login is set up yet. Run this once in a normal command window: "
+                         "python server.py --set-login")
+    print("\nCreate the login for your agent. You will use it every time you open the page.")
+    while True:
+        username = input("Username: ").strip()
+        if not 1 <= len(username) <= 40:
+            print("Use 1 to 40 characters.")
+            continue
+        password = getpass.getpass("Password (at least 6 characters; nothing shows while you type): ")
+        if len(password) < 6:
+            print("That is too short. Use at least 6 characters.")
+            continue
+        if getpass.getpass("Type the password again: ") != password:
+            print("The two passwords were different. Try again.")
+            continue
+        break
+    creds = make_credentials(username, password)
+    save_credentials(creds)
+    print("Login saved.\n")
+    return creds
+
+
+def check_login(username: str, password: str) -> bool:
+    if not CREDENTIALS:
+        return False
+    same_user = hmac.compare_digest(username.encode("utf-8"), CREDENTIALS["username"].encode("utf-8"))
+    candidate = _hash_password(password, bytes.fromhex(CREDENTIALS["salt"])).hex()
+    same_password = hmac.compare_digest(candidate.encode("ascii"), CREDENTIALS["hash"].encode("ascii"))
+    return same_user and same_password
+
+
+def session_valid(request: Request) -> bool:
+    sid = request.cookies.get(SESSION_COOKIE, "")
+    if not sid:
+        return False
+    with AUTH_LOCK:
+        expires = SESSIONS.get(sid)
+        if expires is None:
+            return False
+        if expires < time.time():
+            del SESSIONS[sid]
+            return False
+        return True
 
 
 class State:
@@ -180,8 +300,13 @@ def write_chat_file(chat_id: str, data: dict) -> None:
 
 
 def auto_title(events: list) -> str:
-    first_user = next((e.get("text", "") for e in events if e.get("type") == "user"), "")
-    flat = " ".join(str(first_user).split())
+    first_user = next((e for e in events if isinstance(e, dict) and e.get("type") == "user"), None)
+    text = str(first_user.get("text", "")) if first_user else ""
+    if not text.strip() and first_user:  # a message that is only a pasted text or a file
+        files = [f for f in (first_user.get("files") or []) if isinstance(f, dict)]
+        if files:
+            text = str(files[0].get("preview") or files[0].get("name") or "")
+    flat = " ".join(text.split())
     return flat[:60] + ("..." if len(flat) > 60 else "")
 
 
@@ -286,6 +411,7 @@ def build_context(events: list):
 
 def reset_chat_locked() -> None:
     """Start an empty chat. The caller must already hold state.lock."""
+    agent.clear_pending()
     state.chat_id = new_chat_id()
     state.chat_created = now_iso()
     state.chat_title = None
@@ -342,9 +468,14 @@ def web_confirm(name: str, args: dict) -> bool:
 
 
 def recover_after_failure() -> None:
-    """If this request got at least one answer from the model before it failed, the model's own
-    record of the conversation does not include this request (or what the agent did in it).
-    Continue from a written summary instead, so the next message still knows what happened."""
+    """After a failure, decide how the next message continues.
+    - If the failure was a failed model call (network, timeout, busy model), the agent kept the exact
+      call. Try again sends it again, so everything already done is kept: nothing is repeated and
+      nothing is approved twice. The conversation chain stays as it was.
+    - Otherwise, if the model had already answered during this request, its own record of the
+      conversation does not include this request, so continue from a written summary."""
+    if agent.can_resume():
+        return
     if agent.PROGRESS["model_calls"] > 0:
         with state.lock:
             state.previous_id = None
@@ -353,22 +484,30 @@ def recover_after_failure() -> None:
 
 def explain(e: Exception) -> str:
     names = [cls.__name__ for cls in type(e).__mro__]
-    if "429" in str(e):
-        return ("That is a quota or rate limit. Wait a few minutes or try another "
-                "model from the menu at the top.")
+    text = str(e).lower()
+    again = ("Press Try again: it continues where it stopped and nothing already done is repeated."
+             if agent.can_resume() else "Press Try again.")
+    if "429" in text:
+        return ("That is a quota or rate limit. Wait a few minutes or try another model from the menu "
+                "at the top. " + again)
+    if any(h in text for h in ("error code: 503", "service_unavailable", "high demand", "overloaded")):
+        return ("Google's model is busy right now (high demand). Wait a minute. " + again +
+                " If it keeps happening, pick another model from the menu at the top.")
+    if "APITimeoutError" in names or isinstance(e, TimeoutError) or "timed out" in text:
+        return "No answer arrived in time (a slow connection or a busy model). " + again
     if agent.is_transient(e):
-        return "This looks like a problem with your internet connection. Check it, then press Try again."
-    if "APITimeoutError" in names or isinstance(e, TimeoutError) or "timed out" in str(e).lower():
-        return "The model took too long. Press Try again, or ask for something smaller."
+        return "This looks like a problem with your internet connection. Check it, then press Try again." + (
+            " It continues where it stopped and nothing already done is repeated." if agent.can_resume() else "")
     return ""
 
 
-def run_request(model_text, message: str, use_search: bool) -> None:
+def run_request(model_text, message: str, use_search: bool, resume: bool = False) -> None:
     started = time.time()
     with state.lock:
         state.approval_seconds = 0.0
     try:
-        interaction = agent.ask(model_text, state.previous_id, use_search, user_message=message)
+        interaction = agent.ask(model_text, state.previous_id, use_search, user_message=message,
+                                resume=resume)
         state.previous_id = interaction.id
         state.resume_context = None  # the old chat has now been shown to the model
         with state.lock:
@@ -386,6 +525,40 @@ def run_request(model_text, message: str, use_search: bool) -> None:
         save_current_chat()
         with state.lock:
             state.busy = False
+
+
+# ---------------------------------------------------------------
+# Voice: a recording is turned into text by Gemini
+# ---------------------------------------------------------------
+def transcribe_audio(data: bytes) -> dict:
+    prompt = ("Transcribe this audio exactly as it was spoken, in the language that is spoken. "
+              "Reply with only the transcription text and nothing else. "
+              "If there is no speech, reply with an empty string.")
+    box: dict = {}
+
+    def work():
+        try:
+            box["response"] = agent.client.models.generate_content(
+                model=agent.MODEL,
+                contents=[prompt, agent.types.Part.from_bytes(data=data, mime_type="audio/wav")],
+            )
+        except Exception as e:
+            box["error"] = e
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(60)
+    if thread.is_alive():
+        return {"error": "The model took too long to turn your speech into text. Try again."}
+    if "error" in box:
+        message = str(box["error"])
+        if agent._is_quota_error(message.lower()):
+            return {"error": "Your Google account has reached its limit for now, so the speech could "
+                             "not be turned into text. Wait a few minutes or pick another model at the top."}
+        return {"error": message}
+    agent.record_usage("requests")
+    text = (getattr(box["response"], "text", "") or "").strip()
+    return {"text": text}
 
 
 # ---------------------------------------------------------------
@@ -544,32 +717,21 @@ def restore_backup(data: bytes) -> str:
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
-def _password_ok(request: Request) -> bool:
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("basic "):
-        return False
-    try:
-        decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
-    except Exception:
-        return False
-    given = decoded.split(":", 1)[1] if ":" in decoded else ""
-    return secrets.compare_digest(given.encode("utf-8"), APP_PASSWORD.encode("utf-8"))
-
-
 @app.middleware("http")
 async def guard(request: Request, call_next):
     """Only this computer's browser tab that loaded the page may use the API.
     - Host check blocks DNS-rebinding tricks.
-    - The password (if APP_PASSWORD is set) keeps other people using this computer out.
+    - Sign-in (cookie) keeps anyone who has not entered the username and password out.
     - The secret token (embedded in the page) blocks other websites from calling the API."""
     host = request.headers.get("host", "")
     if host not in ALLOWED_HOSTS:
         return JSONResponse({"error": "forbidden host"}, status_code=403)
-    if APP_PASSWORD and not _password_ok(request):
-        await asyncio.sleep(1)  # slows down guessing
-        return Response("Password needed", status_code=401,
-                        headers={"WWW-Authenticate": 'Basic realm="My AI Agent"'})
-    if request.url.path.startswith("/api/"):
+    path = request.url.path
+    if REQUIRE_LOGIN and path != "/login" and not session_valid(request):
+        if path.startswith("/api/"):
+            return JSONResponse({"error": "login required"}, status_code=401)
+        return RedirectResponse("/login", status_code=303)
+    if path.startswith("/api/"):
         token = request.headers.get("x-session-token", "")
         if not secrets.compare_digest(token, TOKEN):
             return JSONResponse({"error": "session expired - reload the page"}, status_code=403)
@@ -619,22 +781,63 @@ class RunIn(BaseModel):
     code: str
 
 
+class LoginIn(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+# ----- sign-in pages -----
+@app.get("/login")
+def login_page(request: Request):
+    if not REQUIRE_LOGIN or session_valid(request):
+        return RedirectResponse("/", status_code=303)
+    return HTMLResponse(LOGIN_HTML, headers=PAGE_HEADERS)
+
+
+@app.post("/login")
+async def do_login(body: LoginIn):
+    now = time.time()
+    with AUTH_LOCK:
+        FAILED_LOGINS[:] = [t for t in FAILED_LOGINS if now - t < LOCKOUT_SECONDS]
+        locked = len(FAILED_LOGINS) >= MAX_FAILED_LOGINS
+    if locked:
+        return JSONResponse({"error": "Too many wrong attempts. Wait 5 minutes and try again."},
+                            status_code=429)
+    ok = await run_in_threadpool(check_login, body.username[:100], body.password[:200])
+    if not ok:
+        with AUTH_LOCK:
+            FAILED_LOGINS.append(time.time())
+        await asyncio.sleep(1)  # slows down guessing
+        return JSONResponse({"error": "Wrong username or password."}, status_code=401)
+    sid = secrets.token_urlsafe(32)
+    with AUTH_LOCK:
+        for old in [k for k, v in SESSIONS.items() if v < now]:
+            del SESSIONS[old]
+        SESSIONS[sid] = now + SESSION_HOURS * 3600
+        FAILED_LOGINS.clear()
+    response = JSONResponse({"ok": True})
+    response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="strict", path="/")
+    return response
+
+
+@app.post("/api/logout")
+def logout(request: Request):
+    sid = request.cookies.get(SESSION_COOKIE, "")
+    with AUTH_LOCK:
+        SESSIONS.pop(sid, None)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
 @app.get("/")
 def index():
-    headers = {
-        "Cache-Control": "no-store",
-        "X-Frame-Options": "DENY",
-        "Content-Security-Policy": (
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-            "img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'"
-        ),
-    }
     try:
         page = INDEX_FILE.read_text(encoding="utf-8")
     except OSError:
         return HTMLResponse("index.html is missing. Put it in the same folder as server.py.",
                             status_code=500)
-    return HTMLResponse(page.replace("__TOKEN__", TOKEN), headers=headers)
+    return HTMLResponse(page.replace("__TOKEN__", TOKEN), headers=PAGE_HEADERS)
 
 
 def user_name() -> str:
@@ -662,7 +865,7 @@ def get_state():
         "notes": agent.load_memories(),
         "usage": agent.get_usage_today(),
         "instructions": agent.get_instructions(),
-        "password_on": bool(APP_PASSWORD),
+        "login_on": REQUIRE_LOGIN,
     }
 
 
@@ -683,6 +886,7 @@ def choose_model(body: ModelIn):
     if "error" in result:
         return JSONResponse({"error": result["error"]}, status_code=400)
     with state.lock:  # continue the chat from a written summary instead of the old model's record
+        agent.clear_pending()
         state.previous_id = None
         state.resume_context = build_context(state.events)
     return result
@@ -917,6 +1121,28 @@ def run_code(body: RunIn):
     return result
 
 
+# ----- voice -----
+@app.post("/api/transcribe")
+async def transcribe(request: Request):
+    """Receive a recording (WAV, raw bytes) and answer with its text."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_AUDIO_BYTES:
+        return JSONResponse({"error": "That recording is too long."}, status_code=413)
+    chunks, total = [], 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_AUDIO_BYTES:
+            return JSONResponse({"error": "That recording is too long."}, status_code=413)
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    if len(data) < 2000 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return JSONResponse({"error": "That is not a usable recording."}, status_code=400)
+    result = await run_in_threadpool(transcribe_audio, data)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=502)
+    return result
+
+
 # ----- backup and restore -----
 @app.get("/api/backup")
 def backup():
@@ -957,10 +1183,12 @@ async def restore(request: Request):
 # ----- attachments -----
 @app.post("/api/uploads")
 async def upload_file(request: Request):
-    """Receive one file (raw bytes in the body, name in the X-Filename header)."""
+    """Receive one file (raw bytes in the body, name in the X-Filename header).
+    X-Pasted: 1 means it is a long text pasted into the message box: the chat shows it as a card."""
     raw_name = urllib.parse.unquote(request.headers.get("x-filename", "")).strip()
     if not raw_name:
         return JSONResponse({"error": "The file has no name."}, status_code=400)
+    is_pasted = request.headers.get("x-pasted", "") == "1"
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > uploads.MAX_UPLOAD_BYTES:
         return JSONResponse({"error": "That file is too big."}, status_code=413)
@@ -974,13 +1202,17 @@ async def upload_file(request: Request):
         if total > uploads.MAX_UPLOAD_BYTES:
             return JSONResponse({"error": "That file is too big."}, status_code=413)
         chunks.append(chunk)
+    data = b"".join(chunks)
     try:
-        record = await run_in_threadpool(uploads.process_upload, UPLOADS_DIR, raw_name, b"".join(chunks))
+        record = await run_in_threadpool(uploads.process_upload, UPLOADS_DIR, raw_name, data)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except OSError as e:
         return JSONResponse({"error": f"Could not save the file: {e}"}, status_code=500)
     record["id"] = uuid.uuid4().hex[:8]
+    if is_pasted and record["kind"] == "text":
+        record["pasted"] = True
+        record["preview"] = make_preview(uploads.decode_text(data))
     with state.lock:
         if len(state.pending_uploads) >= uploads.MAX_FILES_PER_MESSAGE:
             full = True
@@ -991,7 +1223,8 @@ async def upload_file(request: Request):
         uploads.delete_upload(agent.WORKSPACE, record)
         return JSONResponse({"error": "Too many attached files. Remove one first."}, status_code=400)
     return {"id": record["id"], "name": record["name"], "size": record["size"],
-            "kind": record["kind"], "path": record["path"]}
+            "kind": record["kind"], "path": record["path"],
+            "pasted": bool(record.get("pasted")), "preview": record.get("preview", "")}
 
 
 @app.delete("/api/uploads/{upload_id}")
@@ -1024,7 +1257,12 @@ def chat(body: ChatIn):
                                        "Attach it as a file instead."}, status_code=400)
     if len(ids) > uploads.MAX_FILES_PER_MESSAGE:
         return JSONResponse({"error": "Too many attached files."}, status_code=400)
+    # Typing "retry" or "continue" after a failure works like the Try again button.
+    if (not ids and not body.edit_last and message and len(message) < 40
+            and RETRY_WORDS.match(message) and agent.can_resume()):
+        return retry_last()
     edit_index = None
+    discard_pending = False
     with state.lock:
         if state.busy:
             return JSONResponse({"error": "The agent is still working."}, status_code=409)
@@ -1044,14 +1282,24 @@ def chat(body: ChatIn):
             if not ids:
                 records = list(last["records"])  # keep the files of the message being edited
             context = build_context(state.events[:edit_index])
+        elif agent.can_resume():
+            # A new message instead of Try again: the interrupted step is dropped and the
+            # conversation continues from a written summary of what happened.
+            discard_pending = True
+            context = build_context(state.events)
         else:
             context = state.resume_context
         if not message and not records:
             return JSONResponse({"error": "Empty message."}, status_code=400)
+        if discard_pending:
+            agent.clear_pending()
+            state.previous_id = None
+            state.resume_context = context
         state.busy = True
 
     if len(message) > INLINE_MESSAGE_CHARS:
         # Too long to send as a message: save it as a file and attach it (long files become pictures).
+        # The chat shows it as a "PASTED" card.
         try:
             pasted = uploads.save_pasted_text(UPLOADS_DIR, message)
         except (ValueError, OSError) as e:
@@ -1059,13 +1307,19 @@ def chat(body: ChatIn):
                 state.busy = False
             return JSONResponse({"error": f"Could not save your long text: {e}"}, status_code=400)
         pasted["id"] = uuid.uuid4().hex[:8]
+        pasted["pasted"] = True
+        pasted["preview"] = make_preview(message)
         records = [pasted] + records
         visible = uploads.PASTED_REQUEST
-        flat = " ".join(message.split())
-        shown = flat[:300] + "...\n[Long text: " + str(len(message)) + " characters, attached as a file]"
+        shown = ""
     else:
-        visible = message or (uploads.DEFAULT_REQUEST if records else "")
-        shown = visible
+        pasted_only = bool(records) and all(r.get("pasted") for r in records)
+        if message:
+            visible = shown = message
+        elif pasted_only:
+            visible, shown = uploads.PASTED_REQUEST, ""  # only a pasted card: the chat shows just the card
+        else:
+            visible = shown = uploads.DEFAULT_REQUEST if records else ""
 
     try:
         model_input = build_request_input(visible, records, context)
@@ -1086,8 +1340,14 @@ def chat(body: ChatIn):
                           "use_search": use_search}
     extra = {}
     if records:
-        extra["files"] = [{"name": r["name"], "path": r["path"], "kind": r["kind"], "size": r["size"]}
-                          for r in records]
+        files_info = []
+        for r in records:
+            item = {"name": r["name"], "path": r["path"], "kind": r["kind"], "size": r["size"]}
+            if r.get("pasted"):
+                item["pasted"] = True
+                item["preview"] = r.get("preview", "")
+            files_info.append(item)
+        extra["files"] = files_info
     push("user", text=shown, **extra)
     save_current_chat()
     threading.Thread(target=run_request, args=(model_input, message, use_search), daemon=True).start()
@@ -1096,7 +1356,10 @@ def chat(body: ChatIn):
 
 @app.post("/api/retry")
 def retry_last():
-    """Send the last message again (Try again / Regenerate), with the same attached files."""
+    """Try again / Regenerate.
+    After a failed model call this CONTINUES where the agent stopped: the failed call is sent again with
+    the results of everything that already ran, so nothing is repeated or approved a second time.
+    For a finished answer (Regenerate) the last message is simply asked again."""
     with state.lock:
         last = state.last_request
         if last is None:
@@ -1104,7 +1367,13 @@ def retry_last():
         if state.busy:
             return JSONResponse({"error": "The agent is still working."}, status_code=409)
         state.busy = True
+        resuming = agent.can_resume()
         context = state.resume_context
+    if resuming:
+        push("log", text="  [continuing where it stopped - nothing already done is repeated]")
+        threading.Thread(target=run_request, args=(None, last["message"], last["use_search"], True),
+                         daemon=True).start()
+        return {"ok": True}
     try:
         model_input = build_request_input(last["visible"], last["records"], context)
     except ValueError as e:
@@ -1170,6 +1439,7 @@ def open_chat(chat_id: str):
     with state.lock:
         if state.busy:
             return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
+        agent.clear_pending()
         state.chat_id = chat_id
         state.chat_created = str(data.get("created") or now_iso())
         state.chat_title = str(data.get("custom_title") or "") or None
@@ -1259,15 +1529,100 @@ def delete_chat(chat_id: str):
     return {"ok": True, "reset": reset, "after": after}
 
 
+LOGIN_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in - My AI Agent</title>
+<style>
+  :root { --bg:#f5f6f8; --panel:#ffffff; --text:#1d2330; --muted:#6b7385; --line:#dfe3ea; --accent:#2f5bea;
+          --bad:#c0352b; --input:#ffffff; color-scheme: light; }
+  :root[data-theme="dark"] { --bg:#14171d; --panel:#1c2029; --text:#e6e9f0; --muted:#9aa3b5; --line:#2e3441;
+          --accent:#4f74f0; --bad:#ff7b72; --input:#12151b; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px;
+         font-family: system-ui, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  form { width:min(380px, 100%); background:var(--panel); border:1px solid var(--line); border-radius:14px;
+         padding:28px 26px; display:flex; flex-direction:column; gap:12px; }
+  h1 { margin:0 0 2px; font-size:22px; }
+  p { margin:0 0 6px; color:var(--muted); font-size:14px; }
+  label { font-size:13px; color:var(--muted); }
+  input { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font:inherit;
+          background:var(--input); color:var(--text); margin-top:4px; }
+  button { padding:10px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit;
+           cursor:pointer; margin-top:4px; }
+  button:disabled { opacity:.6; cursor:default; }
+  #err { min-height:20px; color:var(--bad); font-size:13px; }
+</style>
+<script>
+  (function () {
+    var pref = "system";
+    try { pref = localStorage.getItem("theme") || "system"; } catch (e) {}
+    var dark = pref === "dark" || (pref === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  })();
+</script>
+</head>
+<body>
+<form id="form">
+  <h1>My AI Agent</h1>
+  <p>Sign in to continue.</p>
+  <label>Username<input id="u" type="text" autocomplete="username" autofocus required></label>
+  <label>Password<input id="p" type="password" autocomplete="current-password" required></label>
+  <div id="err"></div>
+  <button id="btn" type="submit">Sign in</button>
+</form>
+<script>
+  const form = document.getElementById("form");
+  const err = document.getElementById("err");
+  const btn = document.getElementById("btn");
+  const u = document.getElementById("u");
+  const p = document.getElementById("p");
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    err.textContent = "";
+    btn.disabled = true;
+    try {
+      const res = await fetch("/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: u.value, password: p.value }),
+      });
+      let data = {};
+      try { data = await res.json(); } catch (x) {}
+      if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+      location.href = "/";
+    } catch (ex) {
+      err.textContent = ex.message;
+      p.value = "";
+      p.focus();
+    }
+    btn.disabled = false;
+  });
+</script>
+</body>
+</html>
+"""
+
+
 def main():
+    global CREDENTIALS
+    if "--set-login" in sys.argv:
+        create_login_interactively()
+        print("Done. Start the agent with: python server.py")
+        return
+    if REQUIRE_LOGIN:
+        CREDENTIALS = load_credentials() or create_login_interactively()
+
     agent.LOG_HANDLER = web_log
     agent.CONFIRM_HANDLER = web_confirm
     agent.FILE_HANDLER = announce_file
 
     url = f"http://127.0.0.1:{PORT}"
     print(f"Agent web interface running at {url}")
-    if APP_PASSWORD:
-        print("Password protection is on (the browser will ask for the password).")
+    if REQUIRE_LOGIN:
+        print("Sign-in is on: the browser will ask for your username and password.")
     print("Keep this window open. Press Ctrl+C here to stop it.")
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
