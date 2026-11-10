@@ -44,7 +44,15 @@ INDEX_FILE = agent.BASE_DIR / "index.html"  # the web page
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}  # shown as pictures in the chat
 TEXT_PREVIEW_SUFFIXES = set(agent.ALLOWED_WRITE_EXTENSIONS) | {".log"}
 PREVIEW_CHARS = 20000
-FILE_LIST_LIMIT = 300
+FILE_LIST_LIMIT = 500
+MAX_OFFICE_PREVIEW_BYTES = 30 * 1024 * 1024  # Word, Excel and PowerPoint files bigger than this are not previewed
+
+# Folders and files that are not shown in the Files panel, not offered to the agent as workspace files and
+# not put in a backup: they belong to tools (git, Python, Node...), not to your projects.
+IGNORED_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", "venv", ".venv", ".idea", ".vscode",
+                ".pytest_cache", ".mypy_cache", ".ipynb_checkpoints", ".tox", "snippets"}
+IGNORED_FILES = {".ds_store", "thumbs.db", "desktop.ini"}
+IGNORED_SUFFIXES = (".pyc", ".pyo")
 
 # Typing one of these as a message (right after a failure) means "Try again": the agent continues
 # where it stopped instead of starting the task from the beginning.
@@ -108,6 +116,47 @@ def make_preview(text: str) -> str:
     """The short piece of a pasted text that is shown on its card in the chat."""
     flat = " ".join(str(text).split())
     return flat[:PASTE_PREVIEW_CHARS] + ("..." if len(flat) > PASTE_PREVIEW_CHARS else "")
+
+
+# ---------------------------------------------------------------
+# Workspace files (Files panel, the agent's file list, backup)
+# ---------------------------------------------------------------
+def _is_ignored_dir(name: str) -> bool:
+    return name in IGNORED_DIRS or name.endswith(".egg-info")
+
+
+def _is_ignored_file(name: str) -> bool:
+    lowered = name.lower()
+    return (lowered in IGNORED_FILES or lowered.endswith(IGNORED_SUFFIXES)
+            or ".tmp." in name or name.endswith(".tmp"))
+
+
+def in_hidden_area(relative: str) -> bool:
+    """True for a file inside a tool's own folder (for example .git/objects/...)."""
+    return any(_is_ignored_dir(part) for part in relative.split("/")[:-1])
+
+
+def iter_workspace_files(hidden: set | None = None):
+    """Every file of the workspace except the ones that belong to tools. The names of the folders that
+    were left out are added to `hidden` (when given)."""
+    for root, dirs, files in os.walk(agent.WORKSPACE):
+        kept = []
+        for name in dirs:
+            if _is_ignored_dir(name):
+                if hidden is not None:
+                    hidden.add(name)
+            else:
+                kept.append(name)
+        dirs[:] = sorted(kept)
+        for name in sorted(files):
+            if not _is_ignored_file(name):
+                yield Path(root) / name
+
+
+def tool_list_files() -> dict:
+    """The list_files tool of the agent, without the internal files of git and other tools."""
+    files = [p.relative_to(agent.WORKSPACE).as_posix() for p in iter_workspace_files()]
+    return {"files": files[:200], "total": len(files), "truncated": len(files) > 200}
 
 
 # ---------------------------------------------------------------
@@ -620,13 +669,14 @@ def build_backup(zip_path: Path) -> None:
             if source.exists():
                 zf.write(source, name)
         total = 0
-        for path in agent.WORKSPACE.rglob("*"):
-            if not path.is_file():
-                continue
+        for path in iter_workspace_files():  # without the internal files of git and other tools
             relative = path.relative_to(agent.WORKSPACE).as_posix()
             if relative.startswith(("uploads/", "snippets/")):
                 continue  # attached originals and temporary code are not part of the backup
-            size = path.stat().st_size
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
             if size > MAX_BACKUP_FILE or total + size > MAX_BACKUP_WORKSPACE:
                 continue
             total += size
@@ -1052,23 +1102,30 @@ def download_file(path: str):
 
 # ----- workspace files panel -----
 @app.get("/api/files")
-def list_workspace_files():
+def list_workspace_files(q: str = ""):
+    """The files of the workspace (newest first) without the internal files of git and other tools.
+    q: only files whose path contains this text."""
+    needle = q.strip().lower()[:100]
+    hidden: set = set()
     items = []
-    for path in agent.WORKSPACE.rglob("*"):
-        if not path.is_file() or ".tmp." in path.name or path.name.endswith(".tmp"):
+    for path in iter_workspace_files(hidden):
+        relative = path.relative_to(agent.WORKSPACE).as_posix()
+        if needle and needle not in relative.lower():
             continue
         try:
             stat = path.stat()
         except OSError:
             continue
         items.append({
-            "path": path.relative_to(agent.WORKSPACE).as_posix(),
+            "path": relative,
             "name": path.name,
+            "folder": relative.rsplit("/", 1)[0] if "/" in relative else "",
             "size": stat.st_size,
             "modified": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
         })
     items.sort(key=lambda f: f["modified"], reverse=True)
-    return {"files": items[:FILE_LIST_LIMIT], "more": len(items) > FILE_LIST_LIMIT}
+    return {"files": items[:FILE_LIST_LIMIT], "more": len(items) > FILE_LIST_LIMIT, "total": len(items),
+            "hidden": sorted(hidden)}
 
 
 @app.get("/api/files/preview")
@@ -1084,17 +1141,26 @@ def preview_file(path: str):
         return {"kind": "image"}
     if suffix == ".pdf":
         return {"kind": "pdf", "note": "PDF files have no preview here. Use Download."}
-    raw = target.read_bytes()[:3_000_000]
+    try:
+        size = target.stat().st_size
+        with open(target, "rb") as handle:  # never read a whole huge file just to show its start
+            raw = handle.read(3_000_000)
+    except OSError as e:
+        return JSONResponse({"error": f"Could not read it: {e}"}, status_code=500)
     if suffix in (".docx", ".xlsx", ".pptx"):
+        if size > MAX_OFFICE_PREVIEW_BYTES:
+            return {"kind": "binary", "note": "That file is too big to preview. Use Download."}
         try:
             text = uploads.office_to_text(suffix, target.read_bytes())
         except ValueError as e:
             return {"kind": "binary", "note": str(e)}
-    elif suffix in TEXT_PREVIEW_SUFFIXES:
+    elif suffix in TEXT_PREVIEW_SUFFIXES or b"\x00" not in raw[:8192]:
+        # also files without a known ending that are plain text, such as Procfile or .gitignore
         text = uploads.decode_text(raw)
     else:
         return {"kind": "binary", "note": "No preview for this file type. Use Download."}
-    return {"kind": "text", "text": text[:PREVIEW_CHARS], "truncated": len(text) > PREVIEW_CHARS}
+    return {"kind": "text", "text": text[:PREVIEW_CHARS],
+            "truncated": len(text) > PREVIEW_CHARS or size > len(raw)}
 
 
 @app.delete("/api/files")
@@ -1105,10 +1171,21 @@ def delete_workspace_file(path: str):
         return JSONResponse({"error": "No such file."}, status_code=404)
     if not target.is_file():
         return JSONResponse({"error": "No such file."}, status_code=404)
+    if in_hidden_area(target.relative_to(agent.WORKSPACE).as_posix()):
+        return JSONResponse({"error": "That is an internal file (for example from git). Deleting single "
+                                      "internal files would damage the project, so it is not allowed here."},
+                            status_code=403)
     try:
         target.unlink()
     except OSError as e:
         return JSONResponse({"error": f"Could not delete it: {e}"}, status_code=500)
+    parent = target.parent  # remove the folders that are now empty (rmdir fails on a folder with files)
+    while parent != agent.WORKSPACE and parent.is_relative_to(agent.WORKSPACE):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
     return {"ok": True}
 
 
@@ -1618,6 +1695,8 @@ def main():
     agent.LOG_HANDLER = web_log
     agent.CONFIRM_HANDLER = web_confirm
     agent.FILE_HANDLER = announce_file
+    # The agent's own file list should skip the internal files of git and other tools, like the Files panel.
+    agent.TOOL_FUNCTIONS["list_files"] = tool_list_files
 
     url = f"http://127.0.0.1:{PORT}"
     print(f"Agent web interface running at {url}")

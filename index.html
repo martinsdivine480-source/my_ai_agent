@@ -101,7 +101,7 @@
   button.on { background:var(--bad); color:#fff; border-color:var(--bad); }
   button:disabled { opacity:.5; cursor:default; }
   aside, nav { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px;
-               overflow-y:auto; min-height:0; }
+               overflow-y:auto; overflow-x:hidden; min-height:0; }
   aside h3, nav h3 { margin:4px 0 8px; font-size:14px; }
   .searchbox, .field { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:8px; font:inherit;
                        font-size:13px; background:var(--input-bg); color:var(--text); margin-bottom:8px; }
@@ -121,9 +121,22 @@
   .badge.high { background:var(--err-bg); color:var(--bad); font-weight:600; }
   .tick { color:var(--ok); }
   .tick:hover { color:var(--ok); opacity:.7; }
-  .fileitem { display:flex; align-items:center; gap:2px; font-size:13px; padding:5px 0; border-bottom:1px solid var(--soft-line); }
+  /* Files panel: files grouped by folder, names cut off with ... instead of wrapping */
+  .foldhead { display:flex; align-items:center; gap:6px; padding:7px 2px 4px; margin-top:6px; font-size:12px;
+              font-weight:600; color:var(--muted); cursor:pointer; user-select:none;
+              border-bottom:1px solid var(--soft-line); }
+  .foldhead:hover { color:var(--text); }
+  .foldarrow { flex:0 0 12px; text-align:center; }
+  .foldname { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .foldcount { flex:0 0 auto; font-weight:400; }
+  .fileitem { display:flex; align-items:center; gap:2px; font-size:13px; padding:5px 0 5px 10px;
+              border-bottom:1px solid var(--soft-line); }
+  .fileicon { flex:0 0 20px; text-align:center; }
   .filelabel { flex:1; min-width:0; }
   .filename { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .filemeta { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .fileitem .iconbtn { flex:0 0 auto; }
+  .filesnote { margin-top:10px; font-size:12px; color:var(--muted); line-height:1.4; }
   #attachbar { display:flex; flex-wrap:wrap; gap:6px; padding:0 10px; }
   #attachbar:not(:empty) { padding-top:8px; }
   .chip { display:inline-flex; align-items:center; gap:2px; background:var(--code-bg); border:1px solid var(--line);
@@ -297,6 +310,7 @@
 
     <div id="tab-files" hidden>
       <button id="filesRefresh" class="small wide">Refresh</button>
+      <input id="fileFilter" class="searchbox" type="search" placeholder="Filter files..." maxlength="100">
       <div id="files" class="muted">loading...</div>
     </div>
 
@@ -350,7 +364,9 @@ let userName = "", firstPollDone = false, taskLine = "";
 let currentChatId = "", lastUserEl = null, lastUserText = "", editable = false, editing = false;
 let searchTimer = null;
 let savedTimer = null;
+let filesTimer = null;
 let voiceState = "";  // "", "listening" or "transcribing"
+const collapsedFolders = new Set();  // folders closed in the Files panel
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const TABS = ["tasks", "notes", "files", "settings"];
 // A paste longer than this becomes a "PASTED" card instead of filling the message box.
@@ -390,7 +406,7 @@ async function api(path, options) {
     throw new Error("Please sign in again.");
   }
   if (!res.ok) {
-    if (res.status === 403) fatal = "Session expired. Reload this page.";
+    if (res.status === 403 && !data.error) fatal = "Session expired. Reload this page.";
     throw new Error(data.error || ("HTTP " + res.status));
   }
   return data;
@@ -1460,64 +1476,128 @@ $("restoreFile").onchange = async function () {
 };
 
 // ---------- files panel and preview ----------
-async function loadFiles() {
-  try {
-    const d = await api("/api/files");
-    const box = $("files");
-    box.innerHTML = "";
-    if (!d.files.length) { box.textContent = "The workspace is empty."; return; }
+function fileIcon(name) {
+  const ext = (name.indexOf(".") >= 0 ? name.split(".").pop() : "").toLowerCase();
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"].indexOf(ext) >= 0) return "\uD83D\uDDBC";
+  if (["py", "js", "ts", "jsx", "tsx", "html", "htm", "css", "php", "sql", "json", "java", "c", "cpp", "h",
+       "cs", "go", "rs", "rb", "kt", "swift", "xml", "yaml", "yml", "toml", "ini"].indexOf(ext) >= 0) return "\uD83D\uDCDD";
+  return "\uD83D\uDCC4";
+}
+
+function fileRow(f) {
+  const row = document.createElement("div");
+  row.className = "fileitem";
+  const icon = document.createElement("span");
+  icon.className = "fileicon";
+  icon.textContent = fileIcon(f.name);
+  const label = document.createElement("div");
+  label.className = "filelabel";
+  const name = document.createElement("div");
+  name.className = "filename";
+  name.textContent = f.name;
+  name.title = f.path;
+  const meta = document.createElement("div");
+  meta.className = "filemeta";
+  meta.textContent = formatSize(f.size) + " \u00b7 " + formatWhen(f.modified);
+  label.appendChild(name);
+  label.appendChild(meta);
+  const view = document.createElement("button");
+  view.className = "iconbtn viewbtn";
+  view.title = "Preview";
+  view.textContent = "\uD83D\uDC41";
+  view.onclick = function () { openPreview(f); };
+  const dl = document.createElement("button");
+  dl.className = "iconbtn viewbtn";
+  dl.title = "Download";
+  dl.textContent = "\u2B07";
+  dl.onclick = function () { downloadFile(f.path, f.name); };
+  const del = document.createElement("button");
+  del.className = "iconbtn";
+  del.title = "Delete this file";
+  del.textContent = "\u00d7";
+  del.onclick = async function () {
+    if (!confirm("Delete this file from the workspace?\n\n" + f.path + "\n\nThis cannot be undone.")) return;
+    try {
+      await api("/api/files?path=" + encodeURIComponent(f.path), { method: "DELETE" });
+      loadFiles();
+    } catch (e) { showNotice(e.message); }
+  };
+  row.appendChild(icon);
+  row.appendChild(label);
+  row.appendChild(view);
+  row.appendChild(dl);
+  row.appendChild(del);
+  return row;
+}
+
+function renderFiles(d, q) {
+  const box = $("files");
+  box.innerHTML = "";
+  if (!d.files.length) {
+    box.className = "muted";
+    box.textContent = q ? "No file matches \"" + q + "\"." : "The workspace is empty.";
+  } else {
     box.className = "";
+    const groups = new Map();  // folder -> its files (the files arrive newest first)
     d.files.forEach(function (f) {
-      const row = document.createElement("div");
-      row.className = "fileitem";
-      const label = document.createElement("div");
-      label.className = "filelabel";
-      const name = document.createElement("div");
-      name.className = "filename";
-      name.textContent = f.name;
-      name.title = f.path;
-      const meta = document.createElement("div");
-      meta.className = "muted";
-      meta.textContent = f.path.indexOf("/") > 0 ? f.path.slice(0, f.path.lastIndexOf("/") + 1) + " \u00b7 " + formatSize(f.size)
-                                                  : formatSize(f.size);
-      label.appendChild(name);
-      label.appendChild(meta);
-      const view = document.createElement("button");
-      view.className = "iconbtn viewbtn";
-      view.title = "Preview";
-      view.textContent = "\uD83D\uDC41";
-      view.onclick = function () { openPreview(f); };
-      const dl = document.createElement("button");
-      dl.className = "iconbtn viewbtn";
-      dl.title = "Download";
-      dl.textContent = "\u2B07";
-      dl.onclick = function () { downloadFile(f.path, f.name); };
-      const del = document.createElement("button");
-      del.className = "iconbtn";
-      del.title = "Delete this file";
-      del.textContent = "\u00d7";
-      del.onclick = async function () {
-        if (!confirm("Delete this file from the workspace?\n\n" + f.path + "\n\nThis cannot be undone.")) return;
-        try {
-          await api("/api/files?path=" + encodeURIComponent(f.path), { method: "DELETE" });
-          loadFiles();
-        } catch (e) { showNotice(e.message); }
-      };
-      row.appendChild(label);
-      row.appendChild(view);
-      row.appendChild(dl);
-      row.appendChild(del);
-      box.appendChild(row);
+      const key = f.folder || "";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(f);
     });
-    if (d.more) {
-      const more = document.createElement("div");
-      more.className = "muted";
-      more.textContent = "Showing the newest " + d.files.length + " files.";
-      box.appendChild(more);
-    }
-  } catch (e) { /* ignore */ }
+    groups.forEach(function (list, folder) {
+      const collapsed = collapsedFolders.has(folder) && !q;  // a filter always shows its matches
+      const head = document.createElement("div");
+      head.className = "foldhead";
+      const arrow = document.createElement("span");
+      arrow.className = "foldarrow";
+      arrow.textContent = collapsed ? "\u25B8" : "\u25BE";
+      const nameEl = document.createElement("span");
+      nameEl.className = "foldname";
+      nameEl.textContent = folder ? "\uD83D\uDCC1 " + folder : "\uD83D\uDCC1 workspace";
+      nameEl.title = folder || "workspace";
+      const count = document.createElement("span");
+      count.className = "foldcount";
+      count.textContent = String(list.length);
+      head.appendChild(arrow);
+      head.appendChild(nameEl);
+      head.appendChild(count);
+      head.onclick = function () {
+        if (collapsedFolders.has(folder)) collapsedFolders.delete(folder);
+        else collapsedFolders.add(folder);
+        renderFiles(d, q);
+      };
+      box.appendChild(head);
+      if (!collapsed) list.forEach(function (f) { box.appendChild(fileRow(f)); });
+    });
+  }
+  const notes = [];
+  if (d.more) notes.push("Showing the newest " + d.files.length + " of " + d.total + " files. Use the filter to find older ones.");
+  if (d.hidden && d.hidden.length) notes.push("Not shown (internal files of tools): " + d.hidden.join(", ") + ".");
+  if (notes.length) {
+    const note = document.createElement("div");
+    note.className = "filesnote";
+    note.textContent = notes.join(" ");
+    box.appendChild(note);
+  }
+}
+
+async function loadFiles() {
+  const q = $("fileFilter").value.trim();
+  try {
+    const d = await api("/api/files" + (q ? "?q=" + encodeURIComponent(q) : ""));
+    if (q !== $("fileFilter").value.trim()) return;  // the filter changed while loading: a newer request follows
+    renderFiles(d, q);
+  } catch (e) {
+    const box = $("files");
+    box.className = "muted";
+    box.textContent = "Could not load the files: " + e.message;
+  }
 }
 $("filesRefresh").onclick = loadFiles;
+$("fileFilter").addEventListener("input", function () {
+  clearTimeout(filesTimer);
+  filesTimer = setTimeout(loadFiles, 250);
+});
 
 async function openPreview(f) {
   $("modaltitle").textContent = f.path;
