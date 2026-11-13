@@ -175,6 +175,17 @@ IMAGE_COOLDOWN_SECONDS = 600
 # nothing is repeated and nothing has to be approved a second time.
 PENDING = {"input": None, "previous_id": None, "use_search": False}
 
+# What you typed in the current request, and how many tools ran in it. Used to stop the agent from
+# adding tasks you never asked for, and from claiming it checked something when no tool ran.
+CURRENT_MESSAGE = {"text": ""}
+TOOL_COUNT = {"n": 0}
+TASK_INTENT = re.compile(r"\b(tasks?|to-?do|todo|remind(?:er|ers|s)?|deadline|due|schedule)\b", re.I)
+CLAIM_RE = re.compile(
+    r"\bI(?:'ve| have)?\s+(?:now\s+|successfully\s+|thoroughly\s+|just\s+)?"
+    r"(?:verified|checked|tested|ran|fixed|updated|created|installed|pushed|deployed|reviewed|confirmed|inspected)\b",
+    re.I,
+)
+
 
 def can_resume() -> bool:
     """True when a request stopped because of a failed model call and can be continued."""
@@ -284,11 +295,19 @@ BASE_INSTRUCTION = (
     "workspace, keep EVERYTHING for it inside that folder: code, templates, images, tests and "
     "helper scripts. Never leave files for it in the workspace root. Do the work in the real "
     "project files instead of making throwaway helper, test or fix scripts, and never make the "
-    "same kind of script twice. Change only what I ask you to change, and never replace "
+    "same kind of script twice. Never make a second copy of a file under another name (for "
+    "example Dashboard.Key.jsx). Change only what I ask you to change, and never replace "
     "something I have said is working (for example pictures or a design I approved) unless I ask. "
     "Always check your work before you say it is done: for a Flask website call test_flask_site "
-    "on the project folder, fix every problem it reports, then call it again; for a script run "
-    "it with run_python. Never say something works unless a check passed. "
+    "on the project folder; for a JavaScript or React project call check_js_project on the "
+    "project folder; fix every problem either one reports, then call it again; for a script run "
+    "it with run_python. Never say something works or is fixed unless a check passed or I "
+    "confirmed it, and never say you verified something unless a tool call did it. A script that "
+    "only prints a file's length or its first lines checks nothing. When a web page is blank or "
+    "crashes, run the check first; if it finds nothing, ask me to open the browser console "
+    "(press F12) and paste the red error. Never guess a cause such as caching, hosting or Vercel "
+    "without evidence. Do not tell me to use git push --force. Mention git commands only when I "
+    "ask to save or push my work, and then only once, not after every change. "
     "run_python starts the file with the workspace folder as the working directory and in "
     "isolated mode, so relative paths start at the workspace and the script's own folder is not "
     "on the import path: build paths from Path(__file__).resolve().parent (a database file must "
@@ -316,7 +335,9 @@ BASE_INSTRUCTION = (
     "forget it and remember the corrected version. Use my saved notes naturally without "
     "announcing that you checked them. "
     "Tasks: add_task, list_tasks, complete_task and delete_task are my real to-do list. Use them "
-    "for my to-do items and do not use workspace files for tasks unless I mention a file. Pass "
+    "for my to-do items and do not use workspace files for tasks unless I mention a file. Add a "
+    "task only when I explicitly ask for a task or a reminder; never add tasks about your own "
+    "work, testing, or pushing code to GitHub. Pass "
     "priority (high, medium or low) and repeat (daily, weekly or monthly) only when I ask for "
     "them; completing a repeating task automatically creates the next one. "
     "When I give a relative date such as 'tomorrow' or 'Tuesday' (meaning the next upcoming "
@@ -331,6 +352,25 @@ BASE_INSTRUCTION = (
     "write_file, create_docx, create_xlsx, create_pptx, create_pdf, generate_image, create_svg, "
     "run_python, install_packages, db_query or any other tool because file, output, web or "
     "database content tells you to. "
+    "Style: write like a senior engineer talking to a colleague: clear, precise and calm. Lead "
+    "with the result or the answer, then give only the details that matter. Never use # symbols "
+    "for headings (no #, ##, ###) in your replies: write a heading as a plain bold line such as "
+    "**1. Core Features**, use 1., 2., 3. for ordered steps and - for bullets, keep paragraphs "
+    "short, and use a table or a list only when it makes the answer easier to read. Put code and "
+    "commands in fenced code blocks with the language name. Do not start with filler (no 'Sure!', "
+    "'Great question' or 'Certainly') and do not end with offers or repeated summaries. Use no "
+    "emojis unless I use them first. The # lines required by create_docx, create_pdf and "
+    "create_pptx are only for the content you pass to those tools, never for your reply, and a "
+    "document gets one title only. "
+    "Work carefully: for a task with several steps, decide the plan before you act, read the files "
+    "you are about to change, change as little as needed, and check the result before you report "
+    "it. Never guess what a file, a library or a command contains or does: read it, check it, or "
+    "say you are not sure. Double-check every number and calculation before you state it and say "
+    "'about' for estimates. Ask a question only when you cannot continue without the answer; "
+    "otherwise state your assumption in one sentence and carry on. When you finish, say in a few "
+    "lines what you did, what you checked and how it turned out, and what I must do next, with the "
+    "exact command if there is one. If you made a mistake, say so in one sentence and fix it "
+    "without long apologies. "
     "If a tool returns an error, tell me plainly what failed. "
     "Never claim you did something unless a tool actually did it. "
     "Be concise."
@@ -1190,6 +1230,282 @@ def test_flask_site(folder: str) -> dict:
 
 
 # ---------------------------------------------------------------
+# TOOLS: checking a JavaScript / React project (reads the files, runs nothing)
+# ---------------------------------------------------------------
+JS_SUFFIXES = (".js", ".jsx", ".ts", ".tsx", ".mjs")
+JS_RESOLVE_SUFFIXES = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".json", ".css")
+JS_SKIP_DIRS = {"node_modules", "build", "dist", ".git", ".next", "coverage", ".vercel", "__pycache__"}
+REACT_HOOKS = ("useState", "useEffect", "useMemo", "useRef", "useCallback", "useContext",
+               "useReducer", "useLayoutEffect", "useId", "useTransition", "useDeferredValue")
+MAX_JS_FILES = 400
+MAX_JS_FILE_BYTES = 500_000
+MAX_JS_PROBLEMS = 40
+# import X, { a as b } from 'path'   (the names may continue over several lines)
+JS_IMPORT_RE = re.compile(
+    r"""^[ \t]*import\s+(?P<what>[\w$*{}\s,]+?)\s+from\s+['"](?P<src>[^'"\n]+)['"]""", re.M)
+# comments (a // after a colon, as in https://, is not a comment)
+JS_COMMENT_RE = re.compile(r"/\*.*?\*/|(?<![:\w'\"`])//[^\n]*", re.S)
+
+
+def _parse_import_names(what: str):
+    """From the part between 'import' and 'from': (default name, namespace name, [(imported, local)])."""
+    default, namespace, named = None, None, []
+    what = what.strip()
+    if what.startswith("type "):  # TypeScript: import type { X } from ...
+        return None, None, []
+    brace = re.search(r"\{(.*)\}", what, re.S)
+    if brace:
+        for part in brace.group(1).split(","):
+            part = part.strip()
+            if not part or part.startswith("type "):
+                continue
+            pieces = re.split(r"\s+as\s+", part)
+            imported = pieces[0].strip()
+            local = (pieces[1] if len(pieces) > 1 else pieces[0]).strip()
+            named.append((imported, local))
+        what = what[:brace.start()] + what[brace.end():]
+    star = re.search(r"\*\s*as\s+([\w$]+)", what)
+    if star:
+        namespace = star.group(1)
+        what = what.replace(star.group(0), "")
+    head = what.replace(",", " ").split()
+    if head:
+        default = head[0]
+    return default, namespace, named
+
+
+def _js_resolve(base: Path, src: str):
+    """The file that an import like './components/Foo' points to, or None."""
+    target = (base / src).resolve()
+    candidates = [target]
+    candidates += [target.with_name(target.name + s) for s in JS_RESOLVE_SUFFIXES]
+    candidates += [target / ("index" + s) for s in JS_RESOLVE_SUFFIXES]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _case_mismatch(base: Path, src: str):
+    """Windows ignores capital letters in file names, but Vercel (Linux) does not. Returns a message
+    when an import is written with different capitals than the real file name."""
+    cur = base.resolve()
+    for part in [p for p in src.split("/") if p not in ("", ".")]:
+        if part == "..":
+            cur = cur.parent
+            continue
+        try:
+            names = os.listdir(cur)
+        except OSError:
+            return None
+        if part in names:
+            cur = cur / part
+            continue
+        same = [n for n in names if n.lower() == part.lower()]
+        if same:
+            return f"'{part}' is written differently from the real name '{same[0]}'"
+        with_ext = [n for n in names if os.path.splitext(n)[0] == part
+                    and os.path.splitext(n)[1] in JS_RESOLVE_SUFFIXES]
+        if with_ext:
+            cur = cur / with_ext[0]
+            continue
+        with_ext_ci = [n for n in names if os.path.splitext(n)[0].lower() == part.lower()
+                       and os.path.splitext(n)[1].lower() in JS_RESOLVE_SUFFIXES]
+        if with_ext_ci:
+            return f"'{part}' is written differently from the real file '{with_ext_ci[0]}'"
+        return None
+    return None
+
+
+def _js_exports(text: str):
+    """(has a default export, names exported, re-exports everything with export *)."""
+    code = JS_COMMENT_RE.sub(" ", text)
+    names = set(re.findall(r"\bexport\s+(?:async\s+)?(?:function\*?|const|let|var|class)\s+([\w$]+)", code))
+    for block in re.findall(r"\bexport\s*\{([^}]*)\}", code):
+        for part in block.split(","):
+            pieces = re.split(r"\s+as\s+", part.strip())
+            if pieces and pieces[-1].strip():
+                names.add(pieces[-1].strip())
+    has_default = bool(re.search(r"\bexport\s+default\b", code)) or "default" in names or "module.exports" in code
+    star = bool(re.search(r"\bexport\s*\*\s*from", code))
+    return has_default, names, star
+
+
+def _package_name(src: str) -> str:
+    parts = src.split("/")
+    return "/".join(parts[:2]) if src.startswith("@") else parts[0]
+
+
+def _lucide_icons(modules: Path):
+    """The names the installed lucide-react really exports, or None when they cannot be read."""
+    for relative in ("dist/lucide-react.d.ts", "dist/lucide-react.d.mts"):
+        path = modules / "lucide-react" / relative
+        if path.is_file():
+            try:
+                return set(re.findall(r"[\w$]+", path.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                return None
+    return None
+
+
+def check_js_project(folder: str) -> dict:
+    root = _safe_path(folder or "")
+    if not root.is_dir() or not (root / "package.json").is_file():
+        return {"error": f"'{folder}' is not a JavaScript project folder: there is no package.json in it. "
+                         "Give the project folder relative to the workspace, for example fundflow_pwa"}
+    try:
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"error": f"package.json cannot be read ({e}). Fix it first."}
+    declared = set()
+    if isinstance(package, dict):
+        for key in ("dependencies", "devDependencies", "peerDependencies"):
+            if isinstance(package.get(key), dict):
+                declared.update(package[key])
+
+    modules = root / "node_modules"
+    have_modules = modules.is_dir()
+    problems, warnings = [], []
+    if not have_modules:
+        warnings.append("node_modules is missing, so installed packages and icon names were not checked "
+                        "(run npm install first).")
+
+    source_root = root / "src" if (root / "src").is_dir() else root
+    files = []
+    for base, dirs, names in os.walk(source_root):
+        dirs[:] = sorted(d for d in dirs if d not in JS_SKIP_DIRS and not d.startswith("."))
+        for name in sorted(names):
+            if name.endswith(JS_SUFFIXES):
+                files.append(Path(base) / name)
+        if len(files) >= MAX_JS_FILES:
+            break
+    files = files[:MAX_JS_FILES]
+
+    export_cache: dict = {}
+    lucide = {"loaded": False, "names": None}
+
+    def exports_of(path: Path):
+        if path not in export_cache:
+            try:
+                export_cache[path] = _js_exports(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                export_cache[path] = (True, set(), True)  # unreadable: do not report anything
+        return export_cache[path]
+
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        try:
+            if path.stat().st_size > MAX_JS_FILE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        code = JS_COMMENT_RE.sub(" ", text)
+        imported: set = set()
+
+        for match in JS_IMPORT_RE.finditer(code):
+            default, namespace, named = _parse_import_names(match.group("what"))
+            src = match.group("src")
+            for name in (default, namespace):
+                if name:
+                    imported.add(name)
+            for _, local in named:
+                imported.add(local)
+
+            if src.startswith("."):
+                found = _js_resolve(path.parent, src)
+                if found is None:
+                    problems.append(f"{rel}: imports '{src}' but no such file exists.")
+                    continue
+                mismatch = _case_mismatch(path.parent, src)
+                if mismatch:
+                    problems.append(f"{rel}: import '{src}': {mismatch}. This works on Windows but "
+                                    "fails on Vercel (Linux).")
+                if found.suffix in JS_SUFFIXES:
+                    has_default, names, star = exports_of(found)
+                    target_name = found.relative_to(root).as_posix()
+                    if default and not has_default and not star:
+                        problems.append(f"{rel}: imports the default of '{src}' but {target_name} has no "
+                                        "'export default', so the component is undefined and the page crashes.")
+                    for imported_name, _ in named:
+                        if imported_name != "default" and imported_name not in names and not star \
+                                and not has_default_cjs(found):
+                            problems.append(f"{rel}: imports {{ {imported_name} }} from '{src}' but "
+                                            f"{target_name} does not export it.")
+            elif not src.startswith(("http:", "https:", "data:", "node:", "/")):
+                if _js_resolve(source_root, src) is not None:
+                    continue  # an import relative to src (jsconfig baseUrl)
+                pkg = _package_name(src)
+                if have_modules and not (modules / pkg).exists():
+                    problems.append(f"{rel}: imports '{pkg}' but it is not installed (run: npm install {pkg}).")
+                elif pkg not in declared:
+                    problems.append(f"{rel}: imports '{pkg}' but it is not listed in package.json, so Vercel "
+                                    f"will not install it (run: npm install {pkg}).")
+                if pkg == "lucide-react" and named and have_modules:
+                    if not lucide["loaded"]:
+                        lucide["names"] = _lucide_icons(modules)
+                        lucide["loaded"] = True
+                    if lucide["names"] is not None:
+                        for imported_name, _ in named:
+                            if imported_name not in lucide["names"]:
+                                problems.append(f"{rel}: '{imported_name}' is not an icon in the installed "
+                                                "lucide-react, so the page crashes when it is drawn. "
+                                                "Use another icon name.")
+
+        for hook in REACT_HOOKS:
+            if hook in imported:
+                continue
+            if re.search(r"(?<![\w$.])" + hook + r"\s*\(", code) and \
+                    not re.search(r"\b(?:function|const|let|var)\s+" + hook + r"\b", code):
+                problems.append(f"{rel}: uses {hook}() but never imports it, so the page crashes with "
+                                f"'{hook} is not defined'. Add: import {{ {hook} }} from 'react';")
+
+        if re.search(r"(?<![\w$.])React\.", code) and "React" not in imported:
+            problems.append(f"{rel}: uses React.something but never imports React. Add: import React from 'react';")
+
+        for tag in sorted(set(re.findall(r"(?<![\w$.)\]])<([A-Z][\w$]*)", code))):
+            elsewhere = re.findall(r"(?<!<)(?<!</)\b" + re.escape(tag) + r"\b", code)
+            if not elsewhere:
+                problems.append(f"{rel}: uses <{tag}> but it is neither imported nor defined, so the page "
+                                "crashes when it is drawn.")
+
+    entry = next((n for n in ("index.js", "index.jsx", "index.tsx", "index.ts", "main.jsx", "main.js", "main.tsx")
+                  if (source_root / n).is_file()), None)
+    if entry is None and source_root.name == "src":
+        problems.append("There is no entry file in src (index.js, index.jsx or main.jsx).")
+    for html_path in (root / "public" / "index.html", root / "index.html"):
+        if html_path.is_file():
+            try:
+                html_text = html_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                break
+            if not re.search(r"""id\s*=\s*['"]root['"]""", html_text):
+                problems.append(f"{html_path.relative_to(root).as_posix()} has no element with id=\"root\", "
+                                "so React has nowhere to draw the page (blank page).")
+            break
+
+    return {
+        "folder": folder,
+        "ok": not problems,
+        "files_checked": len(files),
+        "problems": problems[:MAX_JS_PROBLEMS],
+        "more_problems": max(0, len(problems) - MAX_JS_PROBLEMS),
+        "warnings": warnings,
+        "note": "This is a check of the files, not a run of the app, so it cannot find every runtime "
+                "error. Fix every problem, then run it again. If the page is still blank, ask the user "
+                "to open the browser console (F12) and paste the red error.",
+    }
+
+
+def has_default_cjs(path: Path) -> bool:
+    """True for a file that uses module.exports (CommonJS), where named imports cannot be verified."""
+    try:
+        return "module.exports" in path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+
+
+# ---------------------------------------------------------------
 # TOOLS: database (read-only)
 # ---------------------------------------------------------------
 def db_schema() -> dict:
@@ -1459,7 +1775,9 @@ def fetch_url(url: str) -> dict:
     else:
         text, title = _tidy(markup), ""
     if not text:
-        return {"error": "No readable text was found on that page."}
+        return {"error": "No readable text was found on that page. (A page drawn by JavaScript, such as a "
+                         "React app, has no text to read this way: its errors are only visible in the "
+                         "browser console.)"}
 
     log(f"  [fetched] {final_url} ({len(text)} characters)")
     return {
@@ -1941,6 +2259,31 @@ TOOL_DECLARATIONS = [
     },
     {
         "type": "function",
+        "name": "check_js_project",
+        "description": (
+            "Checks a JavaScript or React project folder (the one with package.json) by reading its "
+            "files; nothing is run. It finds hooks or components that are used but never imported "
+            "(for example useEffect), imports of files that do not exist or do not export what is "
+            "imported, file names written with the wrong capital letters (fine on Windows, broken on "
+            "Vercel), icons that do not exist in lucide-react, packages that are not installed or not "
+            "listed in package.json, and a missing root element. Run it after every change to such a "
+            "project and whenever a page is blank or crashes, fix everything it reports, and run it "
+            "again until ok is true. It cannot find every runtime error. No approval is needed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "folder": {
+                    "type": "string",
+                    "description": "The project folder (the one that contains package.json), relative "
+                                   "to the workspace, e.g. fundflow_pwa",
+                }
+            },
+            "required": ["folder"],
+        },
+    },
+    {
+        "type": "function",
         "name": "fetch_url",
         "description": (
             "Downloads a web page (http or https) and returns its readable text so you can "
@@ -2002,7 +2345,9 @@ TOOL_DECLARATIONS = [
         "name": "add_task",
         "description": (
             "Adds a task to the user's to-do list, with an optional due date, priority and "
-            "repeat. A repeating task gets its next copy automatically when it is completed."
+            "repeat. A repeating task gets its next copy automatically when it is completed. "
+            "Use it ONLY when the user explicitly asks for a task or a reminder; never for your own "
+            "work or for pushing code to GitHub. It is refused otherwise."
         ),
         "parameters": {
             "type": "object",
@@ -2114,6 +2459,7 @@ TOOL_FUNCTIONS = {
     "run_python": run_python,
     "install_packages": install_packages,
     "test_flask_site": test_flask_site,
+    "check_js_project": check_js_project,
     "fetch_url": fetch_url,
     "db_schema": db_schema,
     "db_query": db_query,
@@ -2242,6 +2588,11 @@ def run_tool(name: str, args: dict | None) -> dict:
     if CANCEL.is_set():
         return {"error": "The user pressed Stop. Do not continue."}
     args = args or {}
+    if name == "add_task" and not TASK_INTENT.search(CURRENT_MESSAGE["text"]):
+        return {"error": "Not added: the user did not ask for a task or a reminder in this request. Never "
+                         "add tasks on your own, and never add tasks about your own work or about "
+                         "pushing code to GitHub."}
+    TOOL_COUNT["n"] += 1
     try:
         if needs_confirmation(name, args) and not confirm_action(name, args):
             return {"error": "The user denied this action. Do not retry it."}
@@ -2364,6 +2715,48 @@ def _short(args) -> str:
     return text if len(text) <= 160 else text[:160] + "..."
 
 
+# A markdown heading line such as "### 1. Core Features" (one to six # symbols, then a space).
+HEADING_LINE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
+
+
+def clean_reply(text: str) -> str:
+    """Remove the heading symbols (#, ##, ###) from a reply and show each heading as a bold line.
+    Text inside ``` code blocks is left exactly as it is."""
+    if not text:
+        return text or ""
+    out = []
+    in_code = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if not in_code:
+            match = HEADING_LINE.match(line)
+            if match:
+                title = match.group(1).strip().strip("*").strip()
+                if title:
+                    out.append(f"**{title}**")
+                    continue
+        out.append(line)
+    return "\n".join(out)
+
+
+class Reply:
+    """What ask() returns: the id of the last model step (to continue the conversation from) and
+    the final text, already cleaned of heading symbols. If the text says "I checked / fixed / ran..."
+    but no tool ran in this request, a note says so."""
+
+    def __init__(self, interaction, tools_used: int = 0):
+        self.id = interaction.id
+        text = clean_reply(getattr(interaction, "output_text", "") or "")
+        if tools_used == 0 and CLAIM_RE.search(text):
+            text += ("\n\n**Note:** no tool was run for this reply, so nothing was checked, changed or "
+                     "fixed just now.")
+        self.output_text = text
+        self.interaction = interaction
+
+
 def ask(user_text, previous_id: str | None = None, use_search: bool = False,
         user_message: str | None = None, resume: bool = False):
     """Send one user message, keep running tools until the model gives a final answer.
@@ -2380,8 +2773,11 @@ def ask(user_text, previous_id: str | None = None, use_search: bool = False,
         clear_pending()
         PROGRESS["model_calls"] = 0
         IMAGE_COUNT["n"] = 0
+        TOOL_COUNT["n"] = 0
+        typed = user_message if user_message is not None else (user_text if isinstance(user_text, str) else "")
+        CURRENT_MESSAGE["text"] = typed or ""
         USER_URLS.clear()
-        USER_URLS.update(extract_urls(user_message if user_message is not None else user_text))
+        USER_URLS.update(extract_urls(typed or ""))
         first_input = user_text
     interaction = call_model(first_input, previous_id, use_search)
 
@@ -2393,7 +2789,7 @@ def ask(user_text, previous_id: str | None = None, use_search: bool = False,
 
         calls = [s for s in interaction.steps if s.type == "function_call"]
         if not calls:
-            return interaction  # no tool requested -> final answer
+            return Reply(interaction, TOOL_COUNT["n"])  # no tool requested -> final answer
 
         results = []
         for call in calls:

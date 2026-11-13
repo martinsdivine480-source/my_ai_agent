@@ -108,6 +108,14 @@
   .tabs { display:flex; gap:4px; margin-bottom:10px; flex-wrap:wrap; }
   .tabs button { padding:4px 9px; font-size:13px; }
   .tabs button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  /* A message at the top of the right panel: confirmations and errors for Tasks, Notes, Files and Settings. */
+  .panelmsg { margin:0 0 10px; padding:6px 9px; border-radius:8px; font-size:12.5px; line-height:1.4;
+              border:1px solid var(--line); background:var(--code-bg); color:var(--text); }
+  .panelmsg.error { background:var(--err-bg); border-color:var(--err-line); color:var(--bad); }
+  .panelmsg.ok { background:var(--okcard-bg); border-color:var(--okcard-line); color:var(--ok); }
+  .charcount { font-size:12px; color:var(--muted); margin:-2px 0 8px; text-align:right; }
+  .charcount.full { color:var(--bad); font-weight:600; }
+  .notedate { display:block; font-size:11.5px; color:var(--muted); margin-top:2px; }
   .item { font-size:13px; padding:6px 0; border-bottom:1px solid var(--soft-line); }
   .overdue { color:var(--bad); font-weight:600; }
   .addtask { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
@@ -278,6 +286,7 @@
       <button id="tabbtn-files">Files</button>
       <button id="tabbtn-settings">Settings</button>
     </div>
+    <div id="panelmsg" class="panelmsg" role="status" hidden></div>
 
     <div id="tab-tasks">
       <div class="addtask">
@@ -318,6 +327,7 @@
       <h3>Your own instructions</h3>
       <div class="muted">Tell the agent how you like answers: tone, length, language. Saved between sessions.</div>
       <textarea id="instr" class="field" maxlength="1500" placeholder="For example: Keep answers short. Explain code step by step."></textarea>
+      <div id="instrCount" class="charcount">0 / 1500</div>
       <div class="row">
         <button id="instrSave" class="primary small">Save instructions</button>
         <span id="instrSaved" class="savedtick" role="status" hidden><span class="tickdot">&#10003;</span> Saved</span>
@@ -365,9 +375,11 @@ let currentChatId = "", lastUserEl = null, lastUserText = "", editable = false, 
 let searchTimer = null;
 let savedTimer = null;
 let filesTimer = null;
+let panelTimer = null;
 let voiceState = "";  // "", "listening" or "transcribing"
 const collapsedFolders = new Set();  // folders closed in the Files panel
 const MAX_UPLOAD = 10 * 1024 * 1024;
+const INSTR_MAX = 1500;
 const TABS = ["tasks", "notes", "files", "settings"];
 // A paste longer than this becomes a "PASTED" card instead of filling the message box.
 const PASTE_MIN_CHARS = 1500, PASTE_MIN_LINES = 25;
@@ -406,16 +418,35 @@ async function api(path, options) {
     throw new Error("Please sign in again.");
   }
   if (!res.ok) {
-    if (res.status === 403 && !data.error) fatal = "Session expired. Reload this page.";
+    // Only the server's "session expired" answer means the page must be reloaded. Other 403 answers
+    // (for example a refused file delete) carry their own message and are just shown.
+    if (res.status === 403 && /session expired/i.test(data.error || "")) fatal = "Session expired. Reload this page.";
     throw new Error(data.error || ("HTTP " + res.status));
   }
   return data;
 }
 
+// A message under the chat (status line).
 function showNotice(message) {
   notice = message;
   noticeUntil = Date.now() + 8000;
   setStatus();
+}
+
+// A message at the top of the right panel, where the Tasks, Notes, Files and Settings buttons are.
+// kind: "error", "ok" or nothing (plain).
+function panelNotice(text, kind) {
+  const el = $("panelmsg");
+  el.textContent = text;
+  el.className = "panelmsg" + (kind ? " " + kind : "");
+  el.hidden = false;
+  clearTimeout(panelTimer);
+  panelTimer = setTimeout(function () { el.hidden = true; }, kind === "error" ? 9000 : 5000);
+}
+
+function clearPanelNotice() {
+  clearTimeout(panelTimer);
+  $("panelmsg").hidden = true;
 }
 
 function formatDuration(sec) {
@@ -445,7 +476,8 @@ async function loadBlobUrl(path) {
   return URL.createObjectURL(blob);
 }
 
-async function downloadFromApi(url, fallbackName) {
+// inPanel: show a failure in the right panel (for the calendar file and the backup) instead of under the chat.
+async function downloadFromApi(url, fallbackName, inPanel) {
   try {
     const res = await fetch(url, { headers: { "X-Session-Token": TOKEN } });
     if (res.status === 401) { location.href = "/login"; return; }
@@ -470,7 +502,8 @@ async function downloadFromApi(url, fallbackName) {
     a.remove();
     setTimeout(function () { URL.revokeObjectURL(objUrl); }, 10000);
   } catch (e) {
-    showNotice("Could not download: " + e.message);
+    if (inPanel) panelNotice("Could not download: " + e.message, "error");
+    else showNotice("Could not download: " + e.message);
   }
 }
 
@@ -1272,7 +1305,7 @@ function renderTasks(s) {
     tick.className = "iconbtn tick";
     tick.title = "Mark as done";
     tick.textContent = "\u2713";
-    tick.onclick = function () { taskAction("/api/tasks/" + t.id + "/complete", "POST"); };
+    tick.onclick = function () { taskAction("/api/tasks/" + t.id + "/complete", "POST", "Marked as done."); };
     const label = document.createElement("div");
     label.className = "tasklabel";
     label.textContent = t.title + (t.due ? " (due " + t.due + ")" : "") + (t.overdue ? " - OVERDUE" : "");
@@ -1294,7 +1327,7 @@ function renderTasks(s) {
     del.title = "Delete this task";
     del.textContent = "\u00d7";
     del.onclick = function () {
-      if (confirm("Delete this task?\n\n" + t.title)) taskAction("/api/tasks/" + t.id, "DELETE");
+      if (confirm("Delete this task?\n\n" + t.title)) taskAction("/api/tasks/" + t.id, "DELETE", "Task deleted.");
     };
     row.appendChild(del);
     tasks.appendChild(row);
@@ -1311,6 +1344,12 @@ function renderNotes(s) {
     const label = document.createElement("div");
     label.className = "tasklabel";
     label.textContent = n.fact;
+    if (n.saved) {
+      const when = document.createElement("span");
+      when.className = "notedate";
+      when.textContent = "Saved " + n.saved;
+      label.appendChild(when);
+    }
     const edit = document.createElement("button");
     edit.className = "iconbtn editbtn";
     edit.title = "Edit this note";
@@ -1320,8 +1359,9 @@ function renderNotes(s) {
       if (text === null || !text.trim() || text.trim() === n.fact) return;
       try {
         await api("/api/notes/" + n.id, { method: "PUT", body: JSON.stringify({ fact: text }) });
+        panelNotice("Note updated.", "ok");
         loadState();
-      } catch (e) { showNotice(e.message); }
+      } catch (e) { panelNotice(e.message, "error"); }
     };
     const del = document.createElement("button");
     del.className = "iconbtn";
@@ -1331,14 +1371,23 @@ function renderNotes(s) {
       if (!confirm("Delete this note?\n\n" + n.fact)) return;
       try {
         await api("/api/notes/" + n.id, { method: "DELETE" });
+        panelNotice("Note deleted.", "ok");
         loadState();
-      } catch (e) { showNotice(e.message); }
+      } catch (e) { panelNotice(e.message, "error"); }
     };
     row.appendChild(label);
     row.appendChild(edit);
     row.appendChild(del);
     notes.appendChild(row);
   });
+}
+
+function updateInstrCount() {
+  const n = $("instr").value.length;
+  const el = $("instrCount");
+  const full = n >= INSTR_MAX;
+  el.textContent = n + " / " + INSTR_MAX + (full ? " - limit reached, extra text is cut off" : "");
+  el.className = "charcount" + (full ? " full" : "");
 }
 
 async function loadState() {
@@ -1359,7 +1408,10 @@ async function loadState() {
     $("logout").hidden = !s.login_on;
     $("usage").textContent = "Today: " + s.usage.requests + (s.usage.requests === 1 ? " request" : " requests") +
       (s.usage.images ? " \u00b7 " + s.usage.images + (s.usage.images === 1 ? " picture" : " pictures") : "");
-    if (document.activeElement !== $("instr")) $("instr").value = s.instructions || "";
+    if (document.activeElement !== $("instr")) {
+      $("instr").value = s.instructions || "";
+      updateInstrCount();
+    }
     $("settingsInfo").textContent =
       (s.login_on
         ? "Sign-in: you are asked for your username and password every time the server starts. Change them by running: python server.py --set-login."
@@ -1372,49 +1424,69 @@ async function loadState() {
   } catch (e) { /* the polling loop shows connection problems */ }
 }
 
-async function taskAction(path, method) {
+async function taskAction(path, method, okText) {
   try {
-    await api(path, { method: method, body: method === "POST" ? "{}" : undefined });
+    const r = await api(path, { method: method, body: method === "POST" ? "{}" : undefined });
     loadState();
+    if (r.next_due) panelNotice("Done. The next one is due " + r.next_due + ".", "ok");  // a repeating task
+    else if (okText) panelNotice(okText, "ok");
   } catch (e) {
-    showNotice(e.message);
+    panelNotice(e.message, "error");
   }
 }
 
 async function addTask() {
   const titleBox = $("taskTitle");
   const title = titleBox.value.trim();
-  if (!title) return;
+  if (!title) { panelNotice("Type the task first.", "error"); titleBox.focus(); return; }
+  const btn = $("taskAdd");
+  btn.disabled = true;
   try {
-    await api("/api/tasks", { method: "POST", body: JSON.stringify({
+    const r = await api("/api/tasks", { method: "POST", body: JSON.stringify({
       title: title, due_date: $("taskDue").value || null,
       priority: $("taskPriority").value, repeat: $("taskRepeat").value || null }) });
-    titleBox.value = "";
-    $("taskDue").value = "";
-    $("taskPriority").value = "medium";
-    $("taskRepeat").value = "";
-    loadState();
+    if (r.status === "already exists") {  // nothing was added: keep what was typed
+      panelNotice("That task is already on your list (same title and due date).", "error");
+    } else {
+      titleBox.value = "";
+      $("taskDue").value = "";
+      $("taskPriority").value = "medium";
+      $("taskRepeat").value = "";
+      panelNotice("Task added.", "ok");
+      loadState();
+    }
   } catch (e) {
-    showNotice("Could not add the task: " + e.message);
+    panelNotice("Could not add the task: " + e.message, "error");
   }
+  btn.disabled = false;
+  titleBox.focus();
 }
 $("taskAdd").onclick = addTask;
 $("taskTitle").addEventListener("keydown", function (e) {
   if (e.key === "Enter") { e.preventDefault(); addTask(); }
 });
-$("icsBtn").onclick = function () { downloadFromApi("/api/tasks.ics", "tasks.ics"); };
+$("icsBtn").onclick = function () { downloadFromApi("/api/tasks.ics", "tasks.ics", true); };
 
 async function addNote() {
   const box = $("noteText");
   const fact = box.value.trim();
-  if (!fact) return;
+  if (!fact) { panelNotice("Type the note first.", "error"); box.focus(); return; }
+  const btn = $("noteAdd");
+  btn.disabled = true;
   try {
-    await api("/api/notes", { method: "POST", body: JSON.stringify({ fact: fact }) });
-    box.value = "";
-    loadState();
+    const r = await api("/api/notes", { method: "POST", body: JSON.stringify({ fact: fact }) });
+    if (r.status === "already saved") {
+      panelNotice("That note is already saved.", "error");
+    } else {
+      box.value = "";
+      panelNotice("Note added.", "ok");
+      loadState();
+    }
   } catch (e) {
-    showNotice("Could not add the note: " + e.message);
+    panelNotice("Could not add the note: " + e.message, "error");
   }
+  btn.disabled = false;
+  box.focus();
 }
 $("noteAdd").onclick = addNote;
 $("noteText").addEventListener("keydown", function (e) {
@@ -1436,7 +1508,11 @@ function showSavedTick() {
   savedTimer = setTimeout(function () { tick.hidden = true; }, 3000);
 }
 
-$("instr").addEventListener("input", hideSavedTick);  // changed after saving: it is no longer "Saved"
+// Changed after saving: it is no longer "Saved". The counter shows how much of the limit is used.
+$("instr").addEventListener("input", function () {
+  hideSavedTick();
+  updateInstrCount();
+});
 
 $("instrSave").onclick = async function () {
   const btn = $("instrSave");
@@ -1446,12 +1522,12 @@ $("instrSave").onclick = async function () {
     await api("/api/instructions", { method: "POST", body: JSON.stringify({ text: $("instr").value }) });
     showSavedTick();
   } catch (e) {
-    showNotice("Could not save: " + e.message);
+    panelNotice("Could not save: " + e.message, "error");
   }
   btn.disabled = false;
 };
 
-$("backupBtn").onclick = function () { downloadFromApi("/api/backup", "agent-backup.zip"); };
+$("backupBtn").onclick = function () { downloadFromApi("/api/backup", "agent-backup.zip", true); };
 $("restoreBtn").onclick = function () { $("restoreFile").click(); };
 $("restoreFile").onchange = async function () {
   const file = $("restoreFile").files[0];
@@ -1468,10 +1544,10 @@ $("restoreFile").onchange = async function () {
     try { data = await res.json(); } catch (e) {}
     if (res.status === 401) { location.href = "/login"; return; }
     if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
-    showNotice("Restored: " + data.summary + ". Reloading...");
+    panelNotice("Restored: " + data.summary + ". Reloading...", "ok");
     setTimeout(function () { location.reload(); }, 1500);
   } catch (e) {
-    showNotice("Restore failed: " + e.message);
+    panelNotice("Restore failed: " + e.message, "error");
   }
 };
 
@@ -1519,8 +1595,9 @@ function fileRow(f) {
     if (!confirm("Delete this file from the workspace?\n\n" + f.path + "\n\nThis cannot be undone.")) return;
     try {
       await api("/api/files?path=" + encodeURIComponent(f.path), { method: "DELETE" });
+      panelNotice("File deleted.", "ok");
       loadFiles();
-    } catch (e) { showNotice(e.message); }
+    } catch (e) { panelNotice(e.message, "error"); }
   };
   row.appendChild(icon);
   row.appendChild(label);
@@ -1631,6 +1708,7 @@ document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$
 
 // ---------- tabs ----------
 function showTab(name) {
+  clearPanelNotice();
   TABS.forEach(function (t) {
     $("tab-" + t).hidden = t !== name;
     $("tabbtn-" + t).classList.toggle("active", t === name);
