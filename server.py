@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import uvicorn
+from dotenv import dotenv_values, find_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
@@ -81,18 +82,31 @@ MAX_BACKUP_WORKSPACE = 150 * 1024 * 1024
 RESTORE_WORKSPACE_EXTENSIONS = set(agent.ALLOWED_WRITE_EXTENSIONS) | {
     ".docx", ".xlsx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
-# Sign-in. Every time the server starts, all earlier sign-ins stop working, so the page always
-# asks for your username and password again. (Set REQUIRE_LOGIN=false in .env to switch it off.)
+# Sign-in. The username and password are APP_USERNAME and APP_PASSWORD in the .env file. They are read
+# again whenever the file changes, so you can change them at any time without restarting the server.
+# (Set REQUIRE_LOGIN=false in .env to switch the sign-in off; that one needs a restart.)
 REQUIRE_LOGIN = os.getenv("REQUIRE_LOGIN", "true").strip().lower() != "false"
-AUTH_FILE = agent.BASE_DIR / "auth.json"
+AUTH_FILE = agent.BASE_DIR / "auth.json"  # an older saved login, used only when .env has none
 SESSION_COOKIE = "agent_session"
 SESSION_HOURS = 12
 MAX_FAILED_LOGINS = 5
 LOCKOUT_SECONDS = 300
-CREDENTIALS = None  # filled in by main(): {"username": ..., "salt": ..., "hash": ...}
-SESSIONS: dict = {}
+SESSIONS: dict = {}  # session id -> {"exp": expiry time, "fp": fingerprint of the login it was made with}
 FAILED_LOGINS: list = []
 AUTH_LOCK = threading.Lock()
+
+
+def _locate_env_file() -> Path:
+    default = agent.BASE_DIR / ".env"
+    if default.is_file():
+        return default
+    found = find_dotenv()
+    return Path(found) if found else default
+
+
+ENV_FILE = _locate_env_file()
+ENV_LOCK = threading.Lock()
+_ENV_CACHE = {"stamp": "unset", "creds": None}
 
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
@@ -160,25 +174,39 @@ def tool_list_files() -> dict:
 
 
 # ---------------------------------------------------------------
-# Sign-in
+# Sign-in: the username and password live in the .env file
 # ---------------------------------------------------------------
+def env_credentials():
+    """{"username": ..., "password": ...} from APP_USERNAME and APP_PASSWORD in the .env file, or None.
+    The file is read again whenever it changes, so a new username or password works at once."""
+    try:
+        stamp = ENV_FILE.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    with ENV_LOCK:
+        if _ENV_CACHE["stamp"] == stamp:
+            return _ENV_CACHE["creds"]
+    source = os.environ  # no .env file at all: use variables set in Windows itself
+    if stamp is not None:
+        try:
+            source = dotenv_values(ENV_FILE, interpolate=False, encoding="utf-8-sig")
+        except Exception:
+            source = {}
+    username = (source.get("APP_USERNAME") or "").strip()
+    password = source.get("APP_PASSWORD") or ""
+    creds = {"username": username, "password": password} if username and password else None
+    with ENV_LOCK:
+        _ENV_CACHE["stamp"] = stamp
+        _ENV_CACHE["creds"] = creds
+    return creds
+
+
 def _hash_password(password: str, salt: bytes) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
 
 
-def make_credentials(username: str, password: str) -> dict:
-    salt = os.urandom(16)
-    return {"username": username, "salt": salt.hex(), "hash": _hash_password(password, salt).hex()}
-
-
-def save_credentials(creds: dict) -> None:
-    tmp = AUTH_FILE.with_name(AUTH_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(creds), encoding="utf-8")
-    tmp.replace(AUTH_FILE)
-
-
-def load_credentials():
-    """The saved login (auth.json), or one made from APP_USERNAME and APP_PASSWORD in .env."""
+def legacy_credentials():
+    """The older login saved in auth.json (a salted hash). Only used when .env has no login."""
     try:
         data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict) and all(isinstance(data.get(k), str) and data.get(k)
@@ -188,18 +216,76 @@ def load_credentials():
             return data
     except (OSError, ValueError):
         pass
-    username = os.getenv("APP_USERNAME", "").strip()
-    password = os.getenv("APP_PASSWORD", "")
-    if username and password:
-        return make_credentials(username, password)
     return None
 
 
-def create_login_interactively() -> dict:
+def login_configured() -> bool:
+    return bool(env_credentials() or legacy_credentials())
+
+
+def credential_fingerprint() -> str:
+    """Changes whenever the username or password changes. A session made with an older login stops
+    working, so changing the password in .env signs everyone out."""
+    creds = env_credentials()
+    if creds:
+        return hashlib.sha256((creds["username"] + "\x00" + creds["password"]).encode("utf-8")).hexdigest()
+    return "legacy" if AUTH_FILE.exists() else ""
+
+
+def check_login(username: str, password: str) -> bool:
+    creds = env_credentials()
+    if creds:
+        same_user = hmac.compare_digest(username.encode("utf-8"), creds["username"].encode("utf-8"))
+        same_password = hmac.compare_digest(password.encode("utf-8"), creds["password"].encode("utf-8"))
+        return same_user and same_password
+    legacy = legacy_credentials()
+    if legacy:
+        same_user = hmac.compare_digest(username.encode("utf-8"), legacy["username"].encode("utf-8"))
+        candidate = _hash_password(password, bytes.fromhex(legacy["salt"])).hex()
+        same_password = hmac.compare_digest(candidate.encode("ascii"), legacy["hash"].encode("ascii"))
+        return same_user and same_password
+    return False
+
+
+def write_env_values(updates: dict) -> None:
+    """Set or add KEY="value" lines in the .env file. Every other line (for example your API key) stays."""
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        lines = []
+
+    def quote(value: str) -> str:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    done = set()
+    out = []
+    for line in lines:
+        match = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if match and match.group(1) in updates:
+            key = match.group(1)
+            if key not in done:
+                out.append(f"{key}={quote(updates[key])}")
+                done.add(key)
+            continue  # a second line for the same key is dropped
+        out.append(line)
+    for key, value in updates.items():
+        if key not in done:
+            out.append(f"{key}={quote(value)}")
+    tmp = ENV_FILE.with_name(ENV_FILE.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    tmp.replace(ENV_FILE)
+
+
+def create_login_interactively() -> None:
+    """Ask for a username and password and save them as APP_USERNAME and APP_PASSWORD in .env."""
     if not sys.stdin or not sys.stdin.isatty():
-        raise SystemExit("No login is set up yet. Run this once in a normal command window: "
-                         "python server.py --set-login")
-    print("\nCreate the login for your agent. You will use it every time you open the page.")
+        raise SystemExit(
+            "No login is set up yet. Add these two lines to the .env file (" + str(ENV_FILE) + "):\n"
+            "  APP_USERNAME=yourname\n"
+            '  APP_PASSWORD="yourpassword"\n'
+            "or run this once in a normal command window: python server.py --set-login")
+    print("\nCreate the login for your agent. It is saved in the .env file, and you can change it there "
+          "at any time.")
     while True:
         username = input("Username: ").strip()
         if not 1 <= len(username) <= 40:
@@ -213,19 +299,8 @@ def create_login_interactively() -> dict:
             print("The two passwords were different. Try again.")
             continue
         break
-    creds = make_credentials(username, password)
-    save_credentials(creds)
-    print("Login saved.\n")
-    return creds
-
-
-def check_login(username: str, password: str) -> bool:
-    if not CREDENTIALS:
-        return False
-    same_user = hmac.compare_digest(username.encode("utf-8"), CREDENTIALS["username"].encode("utf-8"))
-    candidate = _hash_password(password, bytes.fromhex(CREDENTIALS["salt"])).hex()
-    same_password = hmac.compare_digest(candidate.encode("ascii"), CREDENTIALS["hash"].encode("ascii"))
-    return same_user and same_password
+    write_env_values({"APP_USERNAME": username, "APP_PASSWORD": password})
+    print(f"Login saved in {ENV_FILE}\n")
 
 
 def session_valid(request: Request) -> bool:
@@ -233,11 +308,11 @@ def session_valid(request: Request) -> bool:
     if not sid:
         return False
     with AUTH_LOCK:
-        expires = SESSIONS.get(sid)
-        if expires is None:
+        entry = SESSIONS.get(sid)
+        if entry is None:
             return False
-        if expires < time.time():
-            del SESSIONS[sid]
+        if entry["exp"] < time.time() or entry["fp"] != credential_fingerprint():
+            del SESSIONS[sid]  # expired, or the username or password was changed since it was made
             return False
         return True
 
@@ -846,6 +921,9 @@ def login_page(request: Request):
 
 @app.post("/login")
 async def do_login(body: LoginIn):
+    if not login_configured():
+        return JSONResponse({"error": "No login is set up. Add APP_USERNAME and APP_PASSWORD to the .env file."},
+                            status_code=503)
     now = time.time()
     with AUTH_LOCK:
         FAILED_LOGINS[:] = [t for t in FAILED_LOGINS if now - t < LOCKOUT_SECONDS]
@@ -861,9 +939,9 @@ async def do_login(body: LoginIn):
         return JSONResponse({"error": "Wrong username or password."}, status_code=401)
     sid = secrets.token_urlsafe(32)
     with AUTH_LOCK:
-        for old in [k for k, v in SESSIONS.items() if v < now]:
+        for old in [k for k, v in SESSIONS.items() if v["exp"] < now]:
             del SESSIONS[old]
-        SESSIONS[sid] = now + SESSION_HOURS * 3600
+        SESSIONS[sid] = {"exp": now + SESSION_HOURS * 3600, "fp": credential_fingerprint()}
         FAILED_LOGINS.clear()
     response = JSONResponse({"ok": True})
     response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="strict", path="/")
@@ -1684,13 +1762,12 @@ LOGIN_HTML = r"""<!doctype html>
 
 
 def main():
-    global CREDENTIALS
     if "--set-login" in sys.argv:
         create_login_interactively()
         print("Done. Start the agent with: python server.py")
         return
-    if REQUIRE_LOGIN:
-        CREDENTIALS = load_credentials() or create_login_interactively()
+    if REQUIRE_LOGIN and not login_configured():
+        create_login_interactively()
 
     agent.LOG_HANDLER = web_log
     agent.CONFIRM_HANDLER = web_confirm
@@ -1702,6 +1779,11 @@ def main():
     print(f"Agent web interface running at {url}")
     if REQUIRE_LOGIN:
         print("Sign-in is on: the browser will ask for your username and password.")
+        print(f"They are APP_USERNAME and APP_PASSWORD in {ENV_FILE}")
+        print("Change them there at any time: the new login works at once and signs everyone out.")
+        creds = env_credentials()
+        if creds and len(creds["password"]) < 6:
+            print("  [warning] your password is shorter than 6 characters. A longer one is safer.")
     print("Keep this window open. Press Ctrl+C here to stop it.")
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")

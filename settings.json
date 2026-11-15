@@ -1,4 +1,4 @@
 {
   "model": "gemini-3.5-flash-lite",
-  "instructions": "Stop the ### symbols"
+  "instructions": "turn on dark mode"
 }
