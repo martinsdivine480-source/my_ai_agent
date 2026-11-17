@@ -25,5 +25,18 @@
   },
   "2026-11-13": {
     "requests": 10
+  },
+  "2026-11-15": {
+    "requests": 1
+  },
+  "2026-11-17": {
+    "requests": 2,
+    "models": {
+      "gemini-3.5-flash-lite": 2
+    },
+    "tool_calls": 1,
+    "tools": {
+      "test_web_page": 1
+    }
   }
 }
