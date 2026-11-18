@@ -65,6 +65,10 @@ def _unique(items: list) -> list:
     return out[:MAX_ITEMS]
 
 
+def _is_favicon(url: str) -> bool:
+    return (url or "").split("?")[0].lower().endswith("favicon.ico")
+
+
 def _launch_browser(p, playwright_error, local):
     """Edge or Chrome from this computer first, then Playwright's own Chromium if it is installed.
     Returns (browser, last_error)."""
@@ -114,13 +118,26 @@ def check_page(url: str, shot_dir: Path, workspace: Path, width: int = 390, heig
             page = context.new_page()
 
             def on_console(message):
-                if message.type in ("error", "warning"):
-                    console_errors.append(f"[{message.type}] {_clip(message.text)}")
+                if message.type not in ("error", "warning"):
+                    return
+                text = message.text
+                if "Failed to load resource" in text:
+                    try:
+                        resource = (message.location or {}).get("url", "")
+                    except Exception:
+                        resource = ""
+                    if _is_favicon(resource):
+                        return  # browsers ask for /favicon.ico by themselves: not a page problem
+                    if resource:
+                        text = f"{text} ({resource})"  # say WHICH file failed
+                console_errors.append(f"[{message.type}] {_clip(text)}")
 
             def on_page_error(error):
                 page_errors.append(_clip(error))
 
             def on_request_failed(request):
+                if _is_favicon(request.url):
+                    return
                 try:
                     reason = request.failure
                 except Exception:
@@ -128,7 +145,7 @@ def check_page(url: str, shot_dir: Path, workspace: Path, width: int = 390, heig
                 failed.append(f"{_clip(request.url)} ({reason})")
 
             def on_response(response):
-                if response.status >= 400 and not response.url.endswith("favicon.ico"):
+                if response.status >= 400 and not _is_favicon(response.url):
                     failed.append(f"{_clip(response.url)} (HTTP {response.status})")
 
             page.on("console", on_console)

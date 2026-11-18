@@ -29,6 +29,8 @@ from starlette.concurrency import run_in_threadpool
 
 import agent
 import apptester
+import filehistory
+import gitpanel
 import projectrunner
 import uploads
 
@@ -75,8 +77,10 @@ MAX_CHATS = 500  # the oldest chats are deleted beyond this
 MAX_CONTEXT_CHARS = 24000  # how much of an old chat is shown to the model when you continue it
 MAX_TITLE_CHARS = 80  # longest chat name
 CHAT_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")  # strict: ids become file names
-# Log lines that record something the agent actually did (kept when a chat is summarized for the model).
-ACTION_PREFIXES = ("[tool]", "[ran]", "[fetched]", "[created]", "[tested]", "[task", "[memory")
+# Log lines that record something the agent (or you, with a button) actually did. They are kept when a
+# chat is summarized for the model.
+ACTION_PREFIXES = ("[tool]", "[ran]", "[fetched]", "[created]", "[tested]", "[restored", "[committed",
+                   "[pushed", "[task", "[memory")
 # Log lines that are never shown in the chat, and ones that are kept but hidden.
 NOISE_PREFIXES = ("[waiting for model", "[model replied")
 QUIET_PREFIXES = ("[tool]", "[created]")
@@ -853,7 +857,7 @@ def restore_backup(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------
-# Projects: the Run tab (start and stop a dev server, live log, test the page)
+# Projects: the Run tab and the Git tab
 # ---------------------------------------------------------------
 def project_folder(name: str):
     """The folder of a project (a folder directly inside the workspace), or None."""
@@ -867,6 +871,41 @@ def project_folder(name: str):
     if target.is_dir() and target.parent == agent.WORKSPACE:
         return target
     return None
+
+
+def _generate_text(prompt: str, seconds: int = 30) -> str:
+    """One short answer from the model (not part of the chat). Raises on a problem."""
+    box: dict = {}
+
+    def work():
+        try:
+            box["response"] = agent.client.models.generate_content(model=agent.MODEL, contents=prompt)
+        except Exception as e:
+            box["error"] = e
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        raise TimeoutError("The model took too long to answer.")
+    if "error" in box:
+        raise box["error"]
+    agent.record_usage("requests", model=agent.MODEL)
+    return (getattr(box["response"], "text", "") or "").strip()
+
+
+def ai_commit_message(status: dict) -> str:
+    """A commit message written by the model from the NAMES and kinds of the changed files only.
+    The content of your files is never sent."""
+    lines = [f"{f['label']}: {f['path']}" for f in status.get("files", [])[:60] if not f.get("sensitive")]
+    if not lines:
+        return ""
+    prompt = ("Write a git commit message for a change that touches these files. Use one line of at most "
+              "72 characters in the imperative mood (for example 'Add login page'). Reply with only that "
+              "line, with no quotes and no explanation.\n\n" + "\n".join(lines))
+    text = _generate_text(prompt)
+    first = text.splitlines()[0].strip() if text else ""
+    return first.strip("`'\" ")[:100]
 
 
 # ---------------------------------------------------------------
@@ -944,6 +983,19 @@ class StartIn(BaseModel):
 class TestIn(BaseModel):
     url: str | None = None
     width: int = 390
+
+
+class CommitIn(BaseModel):
+    message: str = ""
+    confirmed: bool = False
+
+
+class ConfirmIn(BaseModel):
+    confirmed: bool = False
+
+
+class SuggestIn(BaseModel):
+    ai: bool = False
 
 
 class TextIn(BaseModel):
@@ -1118,6 +1170,7 @@ def list_projects():
             "running": bool(st.get("running")),
             "url": st.get("url"),
             "command": st.get("command"),
+            "git": (folder / ".git").exists(),
         })
     return {"projects": items}
 
@@ -1167,6 +1220,128 @@ def test_project(name: str, body: TestIn):
         result["screenshot_size"] = (agent.WORKSPACE / result["screenshot"]).stat().st_size
     except OSError:
         pass
+    return result
+
+
+# ----- git (Git tab) -----
+@app.get("/api/projects/{name}/git")
+def project_git(name: str):
+    """Branch, changed files, remotes, the latest commits and a suggested commit message."""
+    folder = project_folder(name)
+    if folder is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    env = agent._clean_env()
+    st = gitpanel.status(folder, env)
+    if st.get("is_repo"):
+        st["commits"] = gitpanel.log(folder, 8, env)
+        st["suggested"] = gitpanel.suggest_message(st["files"])
+    return st
+
+
+@app.post("/api/projects/{name}/git/suggest")
+def project_git_suggest(name: str, body: SuggestIn):
+    """A commit message. ai=false: made from the file names. ai=true: written by the model (it sees only
+    file names and kinds of change, never file content), with the first kind as the fallback."""
+    folder = project_folder(name)
+    if folder is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    st = gitpanel.status(folder, agent._clean_env())
+    if not st.get("is_repo"):
+        return JSONResponse({"error": st.get("note") or "This folder is not a Git repository."},
+                            status_code=400)
+    if st["clean"]:
+        return JSONResponse({"error": "There is nothing to commit."}, status_code=400)
+    message, source, note = gitpanel.suggest_message(st["files"]), "files", ""
+    if body.ai:
+        try:
+            written = ai_commit_message(st)
+            if written:
+                message, source = written, "ai"
+            else:
+                note = "The model gave no message, so the one made from the file names is shown."
+        except Exception as e:
+            note = f"The model could not write one ({str(e)[:120]}), so the one made from the file names is shown."
+    return {"message": message, "source": source, "note": note}
+
+
+@app.post("/api/projects/{name}/git/commit")
+def project_git_commit(name: str, body: CommitIn):
+    folder = project_folder(name)
+    if folder is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    if not body.confirmed:
+        return JSONResponse({"error": "Confirmation is required to commit."}, status_code=400)
+    with state.lock:
+        if state.busy:
+            return JSONResponse({"error": "Wait for the agent to finish first: it may still be changing files."},
+                                status_code=409)
+    result = gitpanel.commit(folder, body.message, agent._clean_env())
+    if "error" in result:
+        text = result["error"] + ((" " + result["hint"]) if result.get("hint") else "")
+        return JSONResponse({"error": text}, status_code=400)
+    first_line = body.message.strip().splitlines()[0][:100]
+    push("log", text=f"  [committed] {name}: {first_line}")
+    return result
+
+
+@app.post("/api/projects/{name}/git/push")
+def project_git_push(name: str, body: ConfirmIn):
+    folder = project_folder(name)
+    if folder is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    if not body.confirmed:
+        return JSONResponse({"error": "Confirmation is required to push."}, status_code=400)
+    with state.lock:
+        if state.busy:
+            return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
+    result = gitpanel.push(folder, agent._clean_env())
+    if "error" in result:
+        text = result["error"] + ((" " + result["hint"]) if result.get("hint") else "")
+        return JSONResponse({"error": text}, status_code=400)
+    push("log", text=f"  [pushed] {name}")
+    return result
+
+
+# ----- version history of the files the agent wrote (undo) -----
+@app.get("/api/history/files")
+def history_files():
+    """The files that have saved versions, most recently changed first."""
+    return {"files": filehistory.list_files(), "stats": filehistory.stats()}
+
+
+@app.get("/api/history")
+def history_list(path: str = ""):
+    """The saved versions of one file, newest first (all files when no path is given)."""
+    return {"entries": filehistory.list_entries(path or None)}
+
+
+@app.get("/api/history/{entry_id}/preview")
+def history_preview(entry_id: int):
+    result = filehistory.preview(entry_id)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=404)
+    return result
+
+
+@app.get("/api/history/{entry_id}/diff")
+def history_diff(entry_id: int):
+    """What restoring this version would change in the file as it is now."""
+    result = filehistory.diff_to_current(entry_id, agent._safe_path)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=404)
+    return result
+
+
+@app.post("/api/history/{entry_id}/restore")
+def history_restore(entry_id: int):
+    """Put a saved version back. The file as it is now is saved first, so a restore can be undone too."""
+    with state.lock:
+        if state.busy:
+            return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
+    result = filehistory.restore(entry_id, agent._safe_path)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    push("log", text=f"  [restored] {result['path']} ({result['status']})")
     return result
 
 
@@ -1943,7 +2118,8 @@ def main():
     print(f"Agent web interface running at {url}")
     if REQUIRE_LOGIN:
         print("Sign-in is on: the browser will ask for your username and password.")
-        print("The new login works at once and signs everyone out.")
+        print(f"They are APP_USERNAME and APP_PASSWORD in {ENV_FILE}")
+        print("Change them there at any time: the new login works at once and signs everyone out.")
         creds = env_credentials()
         if creds and len(creds["password"]) < 6:
             print("  [warning] your password is shorter than 6 characters. A longer one is safer.")
