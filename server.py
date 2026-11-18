@@ -28,6 +28,8 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 import agent
+import apptester
+import projectrunner
 import uploads
 
 HOST = "127.0.0.1"  # this computer only; never change this to 0.0.0.0
@@ -47,6 +49,12 @@ TEXT_PREVIEW_SUFFIXES = set(agent.ALLOWED_WRITE_EXTENSIONS) | {".log"}
 PREVIEW_CHARS = 20000
 FILE_LIST_LIMIT = 500
 MAX_OFFICE_PREVIEW_BYTES = 30 * 1024 * 1024  # Word, Excel and PowerPoint files bigger than this are not previewed
+
+# Attached files with these endings make a message a "coding" message for chat/code model routing.
+CODE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".htm", ".css", ".php", ".sql", ".java",
+                 ".c", ".cpp", ".h", ".cs", ".go", ".rs", ".rb", ".kt", ".swift"}
+# Workspace folders that belong to the agent itself, not to your projects (the Run tab skips them).
+INTERNAL_FOLDERS = {"uploads", "images", "snippets", "documents", "__pycache__"}
 
 # Folders and files that are not shown in the Files panel, not offered to the agent as workspace files and
 # not put in a backup: they belong to tools (git, Python, Node...), not to your projects.
@@ -68,7 +76,7 @@ MAX_CONTEXT_CHARS = 24000  # how much of an old chat is shown to the model when 
 MAX_TITLE_CHARS = 80  # longest chat name
 CHAT_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")  # strict: ids become file names
 # Log lines that record something the agent actually did (kept when a chat is summarized for the model).
-ACTION_PREFIXES = ("[tool]", "[ran]", "[fetched]", "[created]", "[task", "[memory")
+ACTION_PREFIXES = ("[tool]", "[ran]", "[fetched]", "[created]", "[tested]", "[task", "[memory")
 # Log lines that are never shown in the chat, and ones that are kept but hidden.
 NOISE_PREFIXES = ("[waiting for model", "[model replied")
 QUIET_PREFIXES = ("[tool]", "[created]")
@@ -324,6 +332,7 @@ class State:
         self.next_id = 0
         self.busy = False
         self.previous_id = None  # links messages into one conversation
+        self.chain_model = None  # the model that wrote the replies in that conversation
         self.pending = None  # the approval currently waiting for your click
         self.chat_id = new_chat_id()
         self.chat_created = now_iso()
@@ -541,6 +550,7 @@ def reset_chat_locked() -> None:
     state.chat_title = None
     state.chat_pinned = False
     state.previous_id = None
+    state.chain_model = None
     state.resume_context = None
     state.last_request = None
     state.events = []
@@ -603,6 +613,7 @@ def recover_after_failure() -> None:
     if agent.PROGRESS["model_calls"] > 0:
         with state.lock:
             state.previous_id = None
+            state.chain_model = None
             state.resume_context = build_context(state.events)
 
 
@@ -625,20 +636,22 @@ def explain(e: Exception) -> str:
     return ""
 
 
-def run_request(model_text, message: str, use_search: bool, resume: bool = False) -> None:
+def run_request(model_text, message: str, use_search: bool, resume: bool = False,
+                model: str | None = None) -> None:
     started = time.time()
     with state.lock:
         state.approval_seconds = 0.0
     try:
         interaction = agent.ask(model_text, state.previous_id, use_search, user_message=message,
-                                resume=resume)
+                                resume=resume, model=model)
         state.previous_id = interaction.id
+        state.chain_model = agent.LAST_MODEL["name"]  # the model that wrote this reply (a fallback model, if one took over)
         state.resume_context = None  # the old chat has now been shown to the model
         with state.lock:
             waited = state.approval_seconds
         seconds = max(0.0, time.time() - started - waited)  # time spent waiting for your clicks is not counted
         push("answer", text=interaction.output_text or "(The model returned no text.)",
-             regen=True, seconds=round(seconds, 1), ts=time.time())
+             regen=True, seconds=round(seconds, 1), ts=time.time(), model=agent.LAST_MODEL["name"])
     except agent.Cancelled:
         push("log", text="  [stopped by you]")
         recover_after_failure()
@@ -680,7 +693,7 @@ def transcribe_audio(data: bytes) -> dict:
             return {"error": "Your Google account has reached its limit for now, so the speech could "
                              "not be turned into text. Wait a few minutes or pick another model at the top."}
         return {"error": message}
-    agent.record_usage("requests")
+    agent.record_usage("requests", model=agent.MODEL)
     text = (getattr(box["response"], "text", "") or "").strip()
     return {"text": text}
 
@@ -820,6 +833,9 @@ def restore_backup(data: bytes) -> str:
                     agent.update_settings({"instructions": saved["instructions"][:agent.MAX_INSTRUCTIONS_CHARS]})
                 if isinstance(saved.get("model"), str) and agent.MODEL_NAME_RE.match(saved["model"]):
                     agent.set_model(saved["model"])
+                if isinstance(saved.get("routing"), bool):
+                    agent.set_routing(saved["routing"], str(saved.get("chat_model") or ""),
+                                      str(saved.get("code_model") or ""))
                 extras.append("settings")
         elif parts[0] == "workspace" and len(parts) > 1:
             try:
@@ -834,6 +850,23 @@ def restore_backup(data: bytes) -> str:
 
     summary = [f"{chats} chats", f"{files} files"] + extras
     return ", ".join(summary)
+
+
+# ---------------------------------------------------------------
+# Projects: the Run tab (start and stop a dev server, live log, test the page)
+# ---------------------------------------------------------------
+def project_folder(name: str):
+    """The folder of a project (a folder directly inside the workspace), or None."""
+    if (not name or "/" in name or "\\" in name or name.startswith(".")
+            or name in INTERNAL_FOLDERS or _is_ignored_dir(name)):
+        return None
+    try:
+        target = agent._safe_path(name)
+    except ValueError:
+        return None
+    if target.is_dir() and target.parent == agent.WORKSPACE:
+        return target
+    return None
 
 
 # ---------------------------------------------------------------
@@ -896,6 +929,21 @@ class NoteIn(BaseModel):
 
 class ModelIn(BaseModel):
     model: str
+
+
+class RoutingIn(BaseModel):
+    enabled: bool = False
+    chat_model: str = ""
+    code_model: str = ""
+
+
+class StartIn(BaseModel):
+    option: int = 0
+
+
+class TestIn(BaseModel):
+    url: str | None = None
+    width: int = 390
 
 
 class TextIn(BaseModel):
@@ -994,10 +1042,12 @@ def get_state():
         "usage": agent.get_usage_today(),
         "instructions": agent.get_instructions(),
         "login_on": REQUIRE_LOGIN,
+        "routing": agent.get_routing(),
+        "fallback_models": agent.FALLBACK_MODELS,
     }
 
 
-# ----- model and instructions -----
+# ----- model, routing and instructions -----
 @app.get("/api/models")
 def get_models():
     return {"current": agent.MODEL, "models": agent.list_models()}
@@ -1016,7 +1066,21 @@ def choose_model(body: ModelIn):
     with state.lock:  # continue the chat from a written summary instead of the old model's record
         agent.clear_pending()
         state.previous_id = None
+        state.chain_model = None
         state.resume_context = build_context(state.events)
+    return result
+
+
+@app.get("/api/routing")
+def get_routing():
+    return agent.get_routing()
+
+
+@app.post("/api/routing")
+def save_routing(body: RoutingIn):
+    result = agent.set_routing(body.enabled, body.chat_model, body.code_model)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
     return result
 
 
@@ -1025,6 +1089,84 @@ def save_instructions(body: TextIn):
     result = agent.set_instructions(body.text)
     if "error" in result:
         return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+# ----- usage dashboard -----
+@app.get("/api/usage")
+def get_usage(days: int = 14):
+    days = max(1, min(days, 30))
+    return {"today": agent.get_usage_today(), "days": agent.get_usage_history(days),
+            "fallback_models": agent.FALLBACK_MODELS, "routing": agent.get_routing(),
+            "last_model": agent.LAST_MODEL["name"]}
+
+
+# ----- projects (Run tab) -----
+@app.get("/api/projects")
+def list_projects():
+    items = []
+    for name in agent._project_folders():
+        folder = project_folder(name)
+        if folder is None:
+            continue
+        options = projectrunner.detect(folder)
+        st = projectrunner.status(name)
+        items.append({
+            "name": name,
+            "options": [o["label"] for o in options],
+            "needs_install": any(o["kind"] == "node" for o in options) and not (folder / "node_modules").is_dir(),
+            "running": bool(st.get("running")),
+            "url": st.get("url"),
+            "command": st.get("command"),
+        })
+    return {"projects": items}
+
+
+@app.post("/api/projects/{name}/start")
+def start_project(name: str, body: StartIn):
+    folder = project_folder(name)
+    if folder is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    result = projectrunner.start(name, folder, body.option, agent._clean_env())
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+@app.post("/api/projects/{name}/stop")
+def stop_project(name: str):
+    if project_folder(name) is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    return projectrunner.stop(name)
+
+
+@app.get("/api/projects/{name}/status")
+def project_status(name: str, after: int = 0):
+    if project_folder(name) is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    return projectrunner.status(name, max(0, after))
+
+
+@app.post("/api/projects/{name}/test")
+def test_project(name: str, body: TestIn):
+    """Open the running project in a headless browser at phone size and report what is wrong."""
+    if project_folder(name) is None:
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    url = (body.url or "").strip() or (projectrunner.status(name).get("url") or "")
+    if not url:
+        return JSONResponse({"error": "This project is not running yet (no address was found). "
+                                      "Press Run first."}, status_code=400)
+    if not apptester.is_local_url(url):
+        return JSONResponse({"error": "Only addresses on this computer can be tested from here."},
+                            status_code=400)
+    result = apptester.check_page(url, agent.IMAGES_DIR, agent.WORKSPACE,
+                                  width=max(320, min(int(body.width), 1920)))
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    try:
+        result["screenshot_size"] = (agent.WORKSPACE / result["screenshot"]).stat().st_size
+    except OSError:
+        pass
     return result
 
 
@@ -1446,9 +1588,25 @@ def chat(body: ChatIn):
             context = state.resume_context
         if not message and not records:
             return JSONResponse({"error": "Empty message."}, status_code=400)
+
+        # Which model answers this message? (Chat/code routing, when it is switched on.)
+        routing = agent.get_routing()
+        wanted = agent.route_model(
+            message, any(Path(str(r.get("name", ""))).suffix.lower() in CODE_SUFFIXES for r in records))
+        request_model = wanted if routing["active"] else None
+        if (not body.edit_last and not discard_pending and state.previous_id and state.chain_model
+                and wanted != state.chain_model):
+            # The earlier replies were written by a different model (routing chose another one, or a
+            # fallback model took over): continue from a written summary, like a manual model switch.
+            context = build_context(state.events)
+            state.previous_id = None
+            state.chain_model = None
+            state.resume_context = context
+
         if discard_pending:
             agent.clear_pending()
             state.previous_id = None
+            state.chain_model = None
             state.resume_context = context
         state.busy = True
 
@@ -1489,10 +1647,11 @@ def chat(body: ChatIn):
         if edit_index is not None:  # remove the old message and everything after it
             state.events = state.events[:edit_index]
             state.previous_id = None
+            state.chain_model = None
             state.resume_context = context
-    use_search = body.use_search and agent.ENABLE_WEB_SEARCH
-    state.last_request = {"message": message, "visible": visible, "records": records,
-                          "use_search": use_search}
+        use_search = body.use_search and agent.ENABLE_WEB_SEARCH
+        state.last_request = {"message": message, "visible": visible, "records": records,
+                              "use_search": use_search, "model": request_model}
     extra = {}
     if records:
         files_info = []
@@ -1505,7 +1664,8 @@ def chat(body: ChatIn):
         extra["files"] = files_info
     push("user", text=shown, **extra)
     save_current_chat()
-    threading.Thread(target=run_request, args=(model_input, message, use_search), daemon=True).start()
+    threading.Thread(target=run_request, args=(model_input, message, use_search, False, request_model),
+                     daemon=True).start()
     return {"ok": True}
 
 
@@ -1524,6 +1684,8 @@ def retry_last():
         state.busy = True
         resuming = agent.can_resume()
         context = state.resume_context
+        # Keep using the model that wrote the earlier replies, so the conversation chain stays valid.
+        regen_model = state.chain_model if (state.previous_id and state.chain_model) else last.get("model")
     if resuming:
         push("log", text="  [continuing where it stopped - nothing already done is repeated]")
         threading.Thread(target=run_request, args=(None, last["message"], last["use_search"], True),
@@ -1536,7 +1698,8 @@ def retry_last():
             state.busy = False
         return JSONResponse({"error": str(e)}, status_code=400)
     push("log", text="  [trying your last message again]")
-    threading.Thread(target=run_request, args=(model_input, last["message"], last["use_search"]),
+    threading.Thread(target=run_request,
+                     args=(model_input, last["message"], last["use_search"], False, regen_model),
                      daemon=True).start()
     return {"ok": True}
 
@@ -1600,6 +1763,7 @@ def open_chat(chat_id: str):
         state.chat_title = str(data.get("custom_title") or "") or None
         state.chat_pinned = bool(data.get("pinned"))
         state.previous_id = None
+        state.chain_model = None
         state.resume_context = build_context(data["events"])
         state.last_request = None
         state.events = []
@@ -1779,8 +1943,7 @@ def main():
     print(f"Agent web interface running at {url}")
     if REQUIRE_LOGIN:
         print("Sign-in is on: the browser will ask for your username and password.")
-        print(f"They are APP_USERNAME and APP_PASSWORD in {ENV_FILE}")
-        print("Change them there at any time: the new login works at once and signs everyone out.")
+        print("The new login works at once and signs everyone out.")
         creds = env_credentials()
         if creds and len(creds["password"]) < 6:
             print("  [warning] your password is shorter than 6 characters. A longer one is safer.")

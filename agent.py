@@ -1,5 +1,6 @@
 import base64
 import calendar
+import difflib
 import html.parser
 import http.client
 import ipaddress
@@ -27,6 +28,7 @@ load_dotenv()
 
 import apptester  # live app tester (headless browser, needs the playwright package)
 import dbtools  # read-only MySQL access (switched on only when DB_NAME is set in .env)
+import filehistory  # saves every version of the files the agent writes, so you can undo
 import uploads  # imported after load_dotenv so it can read the .env settings
 
 BASE_DIR = Path(__file__).parent
@@ -409,7 +411,9 @@ BASE_INSTRUCTION = (
     "helper scripts. Never leave files for it in the workspace root. Do the work in the real "
     "project files instead of making throwaway helper, test or fix scripts, and never make the "
     "same kind of script twice. Never make a second copy of a file under another name (for "
-    "example Dashboard.Key.jsx). Change only what I ask you to change, and never replace "
+    "example Dashboard.Key.jsx). Every file you write is saved as a version and I can restore "
+    "an earlier one from the Files panel, so never make backup copies such as file.bak or "
+    "file_old.py. Change only what I ask you to change, and never replace "
     "something I have said is working (for example pictures or a design I approved) unless I ask. "
     "Always check your work before you say it is done: for a Flask website call test_flask_site "
     "on the project folder; for a JavaScript or React project call check_js_project on the "
@@ -523,6 +527,10 @@ MAX_IMAGES_PER_REQUEST = 4
 EDITABLE_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}  # pictures the agent may edit
 READ_CHUNK_CHARS = 60000  # how much read_file returns at once
 PREVIEW_CHARS = 3000  # how much of the content you see before approving a write
+DIFF_MAX_CHARS = 8000  # how much of a diff you see before approving an overwrite
+DIFF_MAX_FILE_BYTES = 2_000_000  # a bigger existing file is shown as a plain preview, not a diff
+# The line before the changed lines of a diff in an approval card (the page colours the lines after it).
+DIFF_MARKER = "Changes (only the changed lines are shown, + added, - removed):"
 
 # The four kinds of documents the agent can create: tool name -> (file ending, what to call it)
 DOC_KINDS = {
@@ -856,23 +864,36 @@ def read_file(path: str, start: int = 0) -> dict:
 def write_file(path: str, content: str) -> dict:
     target = _validate_write(path, content)
     existed = target.exists()
+    snapshot = filehistory.capture(target)  # the old content is saved, so this write can be undone
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return {
+    old = snapshot.get("data")
+    unchanged = (old is not None and
+                 old.decode("utf-8", "replace").replace("\r\n", "\n") == content.replace("\r\n", "\n"))
+    if not unchanged:  # writing the same content again needs no new version
+        filehistory.record(target.relative_to(WORKSPACE).as_posix(), "write_file", snapshot,
+                           target.stat().st_size)
+    result = {
         "path": path,
         "status": "overwritten" if existed else "created",
         "chars_written": len(content),
     }
+    if unchanged:
+        result["note"] = "The file already had exactly this content."
+    return result
 
 
 def _create_document(kind: str, path: str, content: str, title: str | None = None) -> dict:
     ext = DOC_KINDS[f"create_{kind}"][0]
     target = _validate_doc(path, content, ext)
     existed = target.exists()
+    snapshot = filehistory.capture(target)  # the old file is saved, so this can be undone
     target.parent.mkdir(parents=True, exist_ok=True)
     import docwriter  # needs python-docx, openpyxl, python-pptx and reportlab
 
     getattr(docwriter, f"build_{kind}")(target, content, title)
+    filehistory.record(target.relative_to(WORKSPACE).as_posix(), f"create_{kind}", snapshot,
+                       target.stat().st_size)
     log(f"  [created] {path}")
     return {
         "path": path,
@@ -2226,7 +2247,9 @@ TOOL_DECLARATIONS = [
         "name": "write_file",
         "description": (
             "Creates a new text or code file, or completely overwrites an existing one, "
-            "in the workspace folder. The user must approve every write. "
+            "in the workspace folder. The user must approve every write, and sees only the changed "
+            "lines when an existing file is overwritten. Every write is saved as a version the user "
+            "can restore. "
             "Provide the FULL file content. Python code, JSON and Jinja templates are checked for "
             "syntax mistakes first and refused if broken. Not for Word, Excel, PowerPoint or PDF files."
         ),
@@ -2661,6 +2684,35 @@ def _preview_lines(content: str) -> list:
     return lines
 
 
+def _diff_preview(target: Path, new_content: str):
+    """Only the changed lines between the file as it is now and the content about to be written,
+    as lines for an approval card. Returns None when the old file cannot be compared (too big or
+    unreadable): the card then shows a plain preview."""
+    try:
+        if target.stat().st_size > DIFF_MAX_FILE_BYTES:
+            return None
+        old = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    old_lines = old.replace("\r\n", "\n").split("\n")
+    new_lines = new_content.replace("\r\n", "\n").split("\n")
+    diff = list(difflib.unified_diff(old_lines, new_lines, lineterm="", n=2))
+    if not diff:
+        return ["No changes: the file already has exactly this content."]
+    body = diff[2:]  # the first two lines are the --- and +++ headers
+    added = sum(1 for line in body if line.startswith("+"))
+    removed = sum(1 for line in body if line.startswith("-"))
+    out = [f"Summary: {added} line(s) added, {removed} line(s) removed.", DIFF_MARKER]
+    used = 0
+    for index, line in enumerate(body):
+        used += len(line) + 3
+        if used > DIFF_MAX_CHARS:
+            out.append(f"... ({len(body) - index} more changed lines not shown)")
+            break
+        out.append("| " + line)
+    return out
+
+
 def describe_action(name: str, args: dict) -> str:
     """Plain-text description of what a tool is about to do, shown before you approve.
     Raises ValueError if the request is not allowed, so you are never asked about it."""
@@ -2670,10 +2722,14 @@ def describe_action(name: str, args: dict) -> str:
         path = args.get("path", "")
         content = args.get("content", "")
         target = _validate_write(path, content)
-        action = "OVERWRITE existing file" if target.exists() else "CREATE new file"
-        lines.append(f"{action}: {path}")
-        lines.append("Content preview:")
-        lines += _preview_lines(content)
+        exists = target.exists()
+        lines.append(("OVERWRITE existing file" if exists else "CREATE new file") + f": {path}")
+        diff = _diff_preview(target, content) if exists else None
+        if diff is not None:
+            lines += diff  # only the added and removed lines
+        else:
+            lines.append("Content preview:")
+            lines += _preview_lines(content)
 
     elif name in DOC_KINDS:
         ext, label = DOC_KINDS[name]

@@ -145,6 +145,29 @@
   .filemeta { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .fileitem .iconbtn { flex:0 0 auto; }
   .filesnote { margin-top:10px; font-size:12px; color:var(--muted); line-height:1.4; }
+  /* Run tab: start a project, live log, open it, test it */
+  .runrow { display:flex; gap:6px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .runrow select { flex:1; min-width:0; }
+  .runstatus { font-size:12.5px; margin:4px 0 8px; word-break:break-all; }
+  .runstatus.up { color:var(--ok); font-weight:600; }
+  .runlog { max-height:240px; overflow:auto; font-size:11.5px; line-height:1.4; white-space:pre-wrap;
+            word-break:break-all; margin:6px 0 8px; }
+  .testbox { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-top:8px; font-size:12.5px;
+             line-height:1.4; }
+  .testbox.ok { border-color:var(--okcard-line); background:var(--okcard-bg); }
+  .testbox.bad { border-color:var(--err-line); background:var(--err-bg); }
+  .testbox ul { margin:4px 0 6px 18px; padding:0; }
+  .testbox li { margin:2px 0; word-break:break-word; }
+  .testbox img { display:block; max-width:100%; border-radius:6px; margin-top:8px; background:#fff; }
+  .testhead { font-weight:600; margin-bottom:4px; }
+  .testsub { font-weight:600; margin-top:6px; }
+  /* Usage tab: bars for requests per day, models and tools */
+  .usagerow { display:flex; align-items:center; gap:6px; font-size:12px; padding:2px 0; }
+  .usagerow .lbl { flex:0 0 74px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .usagerow .track { flex:1; background:var(--code-bg); border-radius:4px; min-width:0; }
+  .usagerow .bar { height:8px; border-radius:4px; background:var(--accent); min-width:2px; }
+  .usagerow .num { flex:0 0 34px; text-align:right; }
+  .usagesum { font-size:13px; line-height:1.5; margin-bottom:6px; }
   #attachbar { display:flex; flex-wrap:wrap; gap:6px; padding:0 10px; }
   #attachbar:not(:empty) { padding-top:8px; }
   .chip { display:inline-flex; align-items:center; gap:2px; background:var(--code-bg); border:1px solid var(--line);
@@ -181,6 +204,7 @@
   .previewimg { max-width:100%; background:#fff; border-radius:6px; }
   .settingsbox textarea { width:100%; min-height:110px; margin-bottom:6px; }
   .settingsbox hr { border:none; border-top:1px solid var(--line); margin:14px 0; }
+  .settingsbox label.check { display:flex; align-items:center; gap:6px; margin:8px 0; cursor:pointer; }
   .savedtick { display:inline-flex; align-items:center; gap:6px; color:var(--ok); font-size:13px;
                font-weight:600; animation: popin .25s ease; }
   .tickdot { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px;
@@ -284,6 +308,8 @@
       <button id="tabbtn-tasks" class="active">Tasks</button>
       <button id="tabbtn-notes">Notes</button>
       <button id="tabbtn-files">Files</button>
+      <button id="tabbtn-run">Run</button>
+      <button id="tabbtn-usage">Usage</button>
       <button id="tabbtn-settings">Settings</button>
     </div>
     <div id="panelmsg" class="panelmsg" role="status" hidden></div>
@@ -323,6 +349,30 @@
       <div id="files" class="muted">loading...</div>
     </div>
 
+    <div id="tab-run" hidden>
+      <div class="muted">Start a project, watch its log, open it, and test it the way a phone visitor sees it.</div>
+      <div class="runrow" style="margin-top:8px">
+        <select id="runProject" title="Choose a project folder"></select>
+      </div>
+      <div class="runrow">
+        <select id="runOption" title="How to start it"></select>
+      </div>
+      <div class="runrow">
+        <button id="runStart" class="primary small">Run</button>
+        <button id="runStop" class="small danger" hidden>Stop</button>
+        <button id="runOpen" class="small" hidden title="Open the running project in a new tab">Open</button>
+        <button id="runTest" class="small" hidden title="Open it in a headless browser at phone size and report errors">Test page</button>
+      </div>
+      <div id="runStatus" class="runstatus muted"></div>
+      <pre id="runLog" class="runlog" hidden></pre>
+      <div id="runTestOut"></div>
+    </div>
+
+    <div id="tab-usage" hidden>
+      <button id="usageRefresh" class="small wide">Refresh</button>
+      <div id="usageBox" class="muted">loading...</div>
+    </div>
+
     <div id="tab-settings" class="settingsbox" hidden>
       <h3>Your own instructions</h3>
       <div class="muted">Tell the agent how you like answers: tone, length, language. Saved between sessions.</div>
@@ -332,6 +382,16 @@
         <button id="instrSave" class="primary small">Save instructions</button>
         <span id="instrSaved" class="savedtick" role="status" hidden><span class="tickdot">&#10003;</span> Saved</span>
       </div>
+      <hr>
+      <h3>Model routing</h3>
+      <div class="muted">Use a light model for ordinary chat and a stronger one for coding. Off by default; when it is off, the model chosen at the top answers everything.</div>
+      <label class="check muted"><input type="checkbox" id="routeOn"> Choose the model for each message</label>
+      <div class="muted">Chat model</div>
+      <select id="routeChat" class="field"></select>
+      <div class="muted">Code model</div>
+      <select id="routeCode" class="field"></select>
+      <button id="routeSave" class="primary small">Save routing</button>
+      <div class="muted" id="fallbackInfo" style="margin-top:8px"></div>
       <hr>
       <h3>Backup</h3>
       <div class="muted">Saves your chats, tasks, notes, settings and created files in one zip file.</div>
@@ -377,10 +437,14 @@ let savedTimer = null;
 let filesTimer = null;
 let panelTimer = null;
 let voiceState = "";  // "", "listening" or "transcribing"
+let currentTab = "tasks";
+let routingState = null, modelNames = [];
+const runState = { project: "", after: 0, timer: null, projects: [], running: false, url: "" };
 const collapsedFolders = new Set();  // folders closed in the Files panel
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const INSTR_MAX = 1500;
-const TABS = ["tasks", "notes", "files", "settings"];
+const TABS = ["tasks", "notes", "files", "run", "usage", "settings"];
+const RUN_LOG_MAX_CHARS = 60000;
 // A paste longer than this becomes a "PASTED" card instead of filling the message box.
 const PASTE_MIN_CHARS = 1500, PASTE_MIN_LINES = 25;
 const CODE_HINT_RE = /[{};=<>]|\bimport\b|\bdef\b|\bfunction\b/;
@@ -943,7 +1007,7 @@ function answerBubble(ev) {
   if (typeof ev.seconds === "number") {
     const took = document.createElement("span");
     took.className = "muted took";
-    took.textContent = "Responded in " + formatDuration(ev.seconds);
+    took.textContent = "Responded in " + formatDuration(ev.seconds) + (ev.model ? " \u00b7 " + ev.model : "");
     bar.appendChild(took);
   }
   d.appendChild(bar);
@@ -1248,19 +1312,48 @@ $("logout").onclick = async function () {
   location.href = "/login";
 };
 
-// ---------- models and usage ----------
+// ---------- models, routing and usage line ----------
+// Select the option with this value; add it first if the list does not have it (a model typed in .env).
+function setSelectValue(sel, value) {
+  if (!value) return;
+  let found = false;
+  Array.prototype.forEach.call(sel.options, function (o) { if (o.value === value) found = true; });
+  if (!found) {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = value;
+    sel.appendChild(o);
+  }
+  sel.value = value;
+}
+
+function fillModelSelect(sel, names) {
+  sel.innerHTML = "";
+  names.forEach(function (name) {
+    const o = document.createElement("option");
+    o.value = name;
+    o.textContent = name;
+    sel.appendChild(o);
+  });
+}
+
+function applyRouting() {
+  if (!routingState || !modelNames.length) return;
+  fillModelSelect($("routeChat"), modelNames);
+  fillModelSelect($("routeCode"), modelNames);
+  setSelectValue($("routeChat"), routingState.chat_model || modelNames[0]);
+  setSelectValue($("routeCode"), routingState.code_model || modelNames[0]);
+  $("routeOn").checked = !!routingState.enabled;
+}
+
 async function loadModels() {
   try {
     const d = await api("/api/models");
     const sel = $("modelsel");
-    sel.innerHTML = "";
-    d.models.forEach(function (name) {
-      const o = document.createElement("option");
-      o.value = name;
-      o.textContent = name;
-      sel.appendChild(o);
-    });
+    fillModelSelect(sel, d.models);
     sel.value = d.current;
+    modelNames = d.models.slice();
+    applyRouting();
   } catch (e) { /* the model menu simply stays empty */ }
 }
 $("modelsel").onchange = async function () {
@@ -1271,6 +1364,21 @@ $("modelsel").onchange = async function () {
     showNotice(e.message);
     loadModels();
   }
+};
+
+$("routeSave").onclick = async function () {
+  const btn = $("routeSave");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/routing", { method: "POST", body: JSON.stringify({
+      enabled: $("routeOn").checked, chat_model: $("routeChat").value, code_model: $("routeCode").value }) });
+    routingState = r;
+    panelNotice(r.enabled ? "Routing is on: chat uses " + r.chat_model + ", code uses " + r.code_model + "."
+                          : "Routing is off. The model chosen at the top answers everything.", "ok");
+  } catch (e) {
+    panelNotice("Could not save routing: " + e.message, "error");
+  }
+  btn.disabled = false;
 };
 
 // ---------- tasks, notes, settings (right panel) ----------
@@ -1407,11 +1515,17 @@ async function loadState() {
     $("webwrap").hidden = !s.web_search;
     $("logout").hidden = !s.login_on;
     $("usage").textContent = "Today: " + s.usage.requests + (s.usage.requests === 1 ? " request" : " requests") +
-      (s.usage.images ? " \u00b7 " + s.usage.images + (s.usage.images === 1 ? " picture" : " pictures") : "");
+      (s.usage.images ? " \u00b7 " + s.usage.images + (s.usage.images === 1 ? " picture" : " pictures") : "") +
+      (s.usage.fallbacks ? " \u00b7 switched model " + s.usage.fallbacks + (s.usage.fallbacks === 1 ? " time" : " times") : "");
     if (document.activeElement !== $("instr")) {
       $("instr").value = s.instructions || "";
       updateInstrCount();
     }
+    routingState = s.routing || routingState;
+    if (!$("tab-settings").hidden === false) applyRouting();
+    $("fallbackInfo").textContent = (s.fallback_models && s.fallback_models.length)
+      ? "If a model is busy or out of quota, the agent switches to: " + s.fallback_models.join(", ") + "."
+      : "Automatic model fallback is off (GEMINI_FALLBACK_MODELS is empty in .env).";
     $("settingsInfo").textContent =
       (s.login_on
         ? "Sign-in: you are asked for your username and password every time the server starts. Change them by running: python server.py --set-login."
@@ -1706,15 +1820,334 @@ $("modalClose").onclick = closePreview;
 $("modal").addEventListener("click", function (e) { if (e.target === $("modal")) closePreview(); });
 document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$("modal").hidden) closePreview(); });
 
+// ---------- run tab: start a project, live log, open it, test it ----------
+function currentProject() {
+  const name = runState.project;
+  return runState.projects.find(function (p) { return p.name === name; }) || null;
+}
+
+function setRunStatus(text, up) {
+  const el = $("runStatus");
+  el.textContent = text;
+  el.className = "runstatus " + (up ? "up" : "muted");
+}
+
+function updateRunButtons() {
+  const p = currentProject();
+  $("runStart").hidden = !p || runState.running;
+  $("runStop").hidden = !runState.running;
+  $("runOpen").hidden = !(runState.running && runState.url);
+  $("runTest").hidden = !(runState.running && runState.url);
+}
+
+function fillRunOptions() {
+  const p = currentProject();
+  const sel = $("runOption");
+  sel.innerHTML = "";
+  if (!p) return;
+  p.options.forEach(function (label, index) {
+    const o = document.createElement("option");
+    o.value = String(index);
+    o.textContent = label;
+    sel.appendChild(o);
+  });
+  sel.hidden = p.options.length < 2;  // a single way to start it needs no menu
+}
+
+async function loadProjects() {
+  try {
+    const d = await api("/api/projects");
+    runState.projects = d.projects;
+    const sel = $("runProject");
+    const keep = runState.project;
+    sel.innerHTML = "";
+    d.projects.forEach(function (p) {
+      const o = document.createElement("option");
+      o.value = p.name;
+      o.textContent = p.name + (p.running ? "  (running)" : "");
+      sel.appendChild(o);
+    });
+    if (!d.projects.length) {
+      runState.project = "";
+      fillRunOptions();
+      updateRunButtons();
+      $("runLog").hidden = true;
+      setRunStatus("No project folders yet. Ask the agent to build a project, or create a folder inside the workspace.", false);
+      return;
+    }
+    const names = d.projects.map(function (p) { return p.name; });
+    sel.value = names.indexOf(keep) >= 0 ? keep : names[0];
+    changeProject(sel.value, keep !== sel.value);
+  } catch (e) {
+    setRunStatus("Could not load the projects: " + e.message, false);
+  }
+}
+
+function changeProject(name, reset) {
+  if (reset || runState.project !== name) {
+    $("runLog").textContent = "";
+    $("runLog").hidden = true;
+    $("runTestOut").innerHTML = "";
+    runState.after = 0;
+    runState.running = false;
+    runState.url = "";
+  }
+  runState.project = name;
+  fillRunOptions();
+  updateRunButtons();
+  refreshRun();
+}
+$("runProject").onchange = function () { changeProject($("runProject").value, true); };
+
+function appendRunLog(lines) {
+  if (!lines.length) return;
+  const log = $("runLog");
+  const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.hidden = false;
+  log.textContent += lines.map(function (l) { return l.text; }).join("\n") + "\n";
+  if (log.textContent.length > RUN_LOG_MAX_CHARS) log.textContent = log.textContent.slice(-RUN_LOG_MAX_CHARS);
+  if (nearBottom) log.scrollTop = log.scrollHeight;
+}
+
+async function refreshRun() {
+  const p = currentProject();
+  if (!p) return;
+  try {
+    const st = await api("/api/projects/" + encodeURIComponent(p.name) + "/status?after=" + runState.after);
+    if (p.name !== runState.project) return;  // another project was chosen while loading
+    appendRunLog(st.lines || []);
+    runState.after = st.next || runState.after;
+    runState.running = !!st.running;
+    runState.url = st.url || "";
+    if (!st.known) {
+      setRunStatus(p.needs_install ? "node_modules is missing. Open Command Prompt in this project folder and run: npm install"
+                                   : "Not running.", false);
+    } else if (st.running) {
+      setRunStatus("Running \u00b7 " + st.command + (st.url ? " \u00b7 " + st.url : " \u00b7 waiting for its address..."), true);
+    } else {
+      setRunStatus("Stopped" + (st.exit_code !== null && st.exit_code !== undefined ? " (exit code " + st.exit_code + ")" : "") + ".", false);
+    }
+    updateRunButtons();
+  } catch (e) {
+    setRunStatus("Could not read the status: " + e.message, false);
+  }
+}
+
+function startRunPolling() {
+  stopRunPolling();
+  runState.timer = setInterval(refreshRun, 1500);
+}
+
+function stopRunPolling() {
+  if (runState.timer) { clearInterval(runState.timer); runState.timer = null; }
+}
+
+$("runStart").onclick = async function () {
+  const p = currentProject();
+  if (!p) return;
+  const label = p.options[parseInt($("runOption").value || "0", 10)] || p.options[0] || "";
+  if (!confirm("Start \"" + p.name + "\" with: " + label + "?\n\nThis runs the project's own code on your computer with your Windows user's permissions. Only start projects you trust.")) return;
+  const btn = $("runStart");
+  btn.disabled = true;
+  try {
+    $("runLog").textContent = "";
+    $("runLog").hidden = true;
+    $("runTestOut").innerHTML = "";
+    runState.after = 0;
+    await api("/api/projects/" + encodeURIComponent(p.name) + "/start", {
+      method: "POST", body: JSON.stringify({ option: parseInt($("runOption").value || "0", 10) }) });
+    await refreshRun();
+    loadProjects();
+  } catch (e) {
+    panelNotice(e.message, "error");
+  }
+  btn.disabled = false;
+};
+
+$("runStop").onclick = async function () {
+  const p = currentProject();
+  if (!p) return;
+  try {
+    await api("/api/projects/" + encodeURIComponent(p.name) + "/stop", { method: "POST", body: "{}" });
+    await refreshRun();
+    loadProjects();
+  } catch (e) {
+    panelNotice(e.message, "error");
+  }
+};
+
+$("runOpen").onclick = function () {
+  if (runState.url) window.open(runState.url, "_blank", "noopener");
+};
+
+function listBlock(parent, title, items) {
+  if (!items || !items.length) return;
+  const h = document.createElement("div");
+  h.className = "testsub";
+  h.textContent = title;
+  parent.appendChild(h);
+  const ul = document.createElement("ul");
+  items.forEach(function (text) {
+    const li = document.createElement("li");
+    li.textContent = text;
+    ul.appendChild(li);
+  });
+  parent.appendChild(ul);
+}
+
+function renderTestResult(r) {
+  const out = $("runTestOut");
+  out.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "testbox " + (r.ok ? "ok" : "bad");
+  const head = document.createElement("div");
+  head.className = "testhead";
+  head.textContent = r.ok ? "Page looks fine" : (r.blank_page ? "The page is blank" : "Problems found");
+  box.appendChild(head);
+  const info = document.createElement("div");
+  info.className = "muted";
+  info.textContent = r.url + " \u00b7 status " + (r.status === null || r.status === undefined ? "?" : r.status) +
+    " \u00b7 " + (r.viewport ? r.viewport[0] + "x" + r.viewport[1] : "");
+  box.appendChild(info);
+  if (r.hint) {
+    const hint = document.createElement("div");
+    hint.textContent = r.hint;
+    box.appendChild(hint);
+  }
+  listBlock(box, "Crashes", r.page_errors);
+  listBlock(box, "Console messages", r.console_messages);
+  listBlock(box, "Failed requests", r.failed_requests);
+  if (r.layout_note) {
+    const note = document.createElement("div");
+    note.textContent = r.layout_note;
+    box.appendChild(note);
+  }
+  if (r.screenshot) {
+    const img = document.createElement("img");
+    img.alt = "Screenshot of the page";
+    loadBlobUrl(r.screenshot).then(function (url) { img.src = url; }).catch(function () { img.remove(); });
+    box.appendChild(img);
+    const dl = document.createElement("button");
+    dl.className = "small";
+    dl.style.marginTop = "6px";
+    dl.textContent = "Download screenshot";
+    dl.onclick = function () { downloadFile(r.screenshot, r.screenshot.split("/").pop()); };
+    box.appendChild(dl);
+  }
+  out.appendChild(box);
+}
+
+$("runTest").onclick = async function () {
+  const p = currentProject();
+  if (!p) return;
+  const btn = $("runTest");
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "Testing...";
+  $("runTestOut").innerHTML = "";
+  try {
+    const r = await api("/api/projects/" + encodeURIComponent(p.name) + "/test", { method: "POST", body: "{}" });
+    renderTestResult(r);
+  } catch (e) {
+    panelNotice("Test failed: " + e.message, "error");
+  }
+  btn.textContent = old;
+  btn.disabled = false;
+};
+
+// ---------- usage tab ----------
+function sumField(days, field) {
+  const total = {};
+  days.forEach(function (d) {
+    Object.keys(d[field] || {}).forEach(function (k) { total[k] = (total[k] || 0) + d[field][k]; });
+  });
+  return total;
+}
+
+function barRows(parent, title, entries, limit) {
+  const h = document.createElement("h3");
+  h.textContent = title;
+  parent.appendChild(h);
+  if (!entries.length) {
+    const none = document.createElement("div");
+    none.className = "muted";
+    none.textContent = "Nothing yet.";
+    parent.appendChild(none);
+    return;
+  }
+  const shown = entries.slice(0, limit || 10);
+  const max = Math.max.apply(null, shown.map(function (e) { return e[1]; })) || 1;
+  shown.forEach(function (e) {
+    const row = document.createElement("div");
+    row.className = "usagerow";
+    const lbl = document.createElement("span");
+    lbl.className = "lbl";
+    lbl.textContent = e[0];
+    lbl.title = e[0];
+    const track = document.createElement("div");
+    track.className = "track";
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    bar.style.width = Math.max(2, Math.round(e[1] / max * 100)) + "%";
+    track.appendChild(bar);
+    const num = document.createElement("span");
+    num.className = "num";
+    num.textContent = String(e[1]);
+    row.appendChild(lbl);
+    row.appendChild(track);
+    row.appendChild(num);
+    parent.appendChild(row);
+  });
+}
+
+function sortedEntries(obj) {
+  return Object.keys(obj).map(function (k) { return [k, obj[k]]; })
+    .sort(function (a, b) { return b[1] - a[1]; });
+}
+
+async function loadUsage() {
+  const box = $("usageBox");
+  try {
+    const d = await api("/api/usage?days=14");
+    box.innerHTML = "";
+    box.className = "";
+    const t = d.today;
+    const sum = document.createElement("div");
+    sum.className = "usagesum";
+    sum.textContent = "Today: " + t.requests + " model requests, " + t.tool_calls + " tool runs, " + t.images +
+      " pictures, " + t.fallbacks + " model switches." + (d.last_model ? " Last answered by " + d.last_model + "." : "");
+    box.appendChild(sum);
+    const dayEntries = d.days.map(function (x) { return [x.date.slice(5), x.requests]; });
+    barRows(box, "Requests per day (14 days)", dayEntries, 14);
+    barRows(box, "Models (14 days)", sortedEntries(sumField(d.days, "models")), 8);
+    barRows(box, "Tools run (14 days)", sortedEntries(sumField(d.days, "tools")), 12);
+    const total = d.days.reduce(function (n, x) { return n + x.fallbacks; }, 0);
+    const foot = document.createElement("div");
+    foot.className = "muted";
+    foot.style.marginTop = "8px";
+    foot.textContent = "Model switches in 14 days: " + total + ". Counts are kept for 30 days.";
+    box.appendChild(foot);
+  } catch (e) {
+    box.className = "muted";
+    box.textContent = "Could not load the usage: " + e.message;
+  }
+}
+$("usageRefresh").onclick = loadUsage;
+
 // ---------- tabs ----------
 function showTab(name) {
   clearPanelNotice();
+  currentTab = name;
   TABS.forEach(function (t) {
     $("tab-" + t).hidden = t !== name;
     $("tabbtn-" + t).classList.toggle("active", t === name);
   });
   try { localStorage.setItem("tab", name); } catch (e) {}
   if (name === "files") loadFiles();
+  if (name === "usage") loadUsage();
+  if (name === "settings") applyRouting();
+  if (name === "run") { loadProjects(); startRunPolling(); }
+  else stopRunPolling();
 }
 TABS.forEach(function (t) { $("tabbtn-" + t).onclick = function () { showTab(t); }; });
 
@@ -1734,6 +2167,7 @@ async function poll() {
         loadState();
         loadChats();
         if (!$("tab-files").hidden) loadFiles();
+        if (!$("tab-usage").hidden) loadUsage();
       }
       lastBusy = busy;
       updateEditButton();
