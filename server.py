@@ -2118,8 +2118,7 @@ def main():
     print(f"Agent web interface running at {url}")
     if REQUIRE_LOGIN:
         print("Sign-in is on: the browser will ask for your username and password.")
-        print(f"They are APP_USERNAME and APP_PASSWORD in {ENV_FILE}")
-        print("Change them there at any time: the new login works at once and signs everyone out.")
+        print("The new login works at once and signs everyone out.")
         creds = env_credentials()
         if creds and len(creds["password"]) < 6:
             print("  [warning] your password is shorter than 6 characters. A longer one is safer.")

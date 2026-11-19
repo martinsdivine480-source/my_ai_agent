@@ -40,18 +40,22 @@
     }
   },
   "2026-11-18": {
-    "requests": 53,
+    "requests": 67,
     "models": {
-      "gemini-3.5-flash-lite": 53
+      "gemini-3.5-flash-lite": 67
     },
-    "tool_calls": 37,
+    "tool_calls": 46,
     "tools": {
       "write_file": 2,
       "read_file": 16,
       "list_files": 3,
       "test_flask_site": 10,
       "run_python": 4,
-      "install_packages": 2
-    }
+      "install_packages": 2,
+      "generate_image": 1,
+      "create_svg": 1,
+      "search_images": 7
+    },
+    "fallbacks": 4
   }
 }

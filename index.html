@@ -61,6 +61,13 @@
   .card pre { max-height:320px; overflow:auto; background:var(--cardpre-bg); }
   code { background:var(--code-bg); padding:1px 4px; border-radius:4px; font-family: Consolas, monospace; font-size:12.5px; }
   pre code { background:transparent; padding:0; }
+  /* Colored changed lines: approval cards for file overwrites, and History > Compare */
+  .dl { display:block; width:max-content; min-width:100%; padding:0 4px; white-space:pre; }
+  .dl.dadd { background:rgba(46,139,87,.22); }
+  .dl.ddel { background:rgba(192,53,43,.2); }
+  .dl.dhunk { background:rgba(127,127,127,.14); color:var(--muted); }
+  .dl.dmore { color:var(--muted); font-style:italic; }
+  .diffsum { font-size:12.5px; margin:0 0 6px; line-height:1.4; }
   .md > :first-child { margin-top:0; }
   .md > :last-child { margin-bottom:0; }
   .md p { margin:0 0 8px; white-space:pre-wrap; }
@@ -105,9 +112,9 @@
   aside h3, nav h3 { margin:4px 0 8px; font-size:14px; }
   .searchbox, .field { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:8px; font:inherit;
                        font-size:13px; background:var(--input-bg); color:var(--text); margin-bottom:8px; }
-  .tabs { display:flex; gap:4px; margin-bottom:10px; flex-wrap:wrap; }
-  .tabs button { padding:4px 9px; font-size:13px; }
-  .tabs button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .tabs, .subtabs { display:flex; gap:4px; margin-bottom:10px; flex-wrap:wrap; }
+  .tabs button, .subtabs button { padding:4px 9px; font-size:13px; }
+  .tabs button.active, .subtabs button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
   /* A message at the top of the right panel: confirmations and errors for Tasks, Notes, Files and Settings. */
   .panelmsg { margin:0 0 10px; padding:6px 9px; border-radius:8px; font-size:12.5px; line-height:1.4;
               border:1px solid var(--line); background:var(--code-bg); color:var(--text); }
@@ -145,6 +152,15 @@
   .filemeta { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .fileitem .iconbtn { flex:0 0 auto; }
   .filesnote { margin-top:10px; font-size:12px; color:var(--muted); line-height:1.4; }
+  /* History view (Files tab): saved versions of the files the agent changed */
+  .histrow { display:flex; align-items:center; gap:2px; font-size:13px; padding:6px 0 6px 4px;
+             border-bottom:1px solid var(--soft-line); }
+  .histrow.clickable { cursor:pointer; }
+  .histrow.clickable:hover { background:var(--hover); }
+  .histlabel { flex:1; min-width:0; }
+  .histhead { display:flex; align-items:center; gap:6px; margin:0 0 8px; font-size:13px; font-weight:600; min-width:0; }
+  .histhead .filename { flex:1; min-width:0; }
+  .histstats { font-size:12px; color:var(--muted); margin:0 0 8px; line-height:1.4; }
   /* Run tab: start a project, live log, open it, test it */
   .runrow { display:flex; gap:6px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
   .runrow select { flex:1; min-width:0; }
@@ -161,6 +177,18 @@
   .testbox img { display:block; max-width:100%; border-radius:6px; margin-top:8px; background:#fff; }
   .testhead { font-weight:600; margin-bottom:4px; }
   .testsub { font-weight:600; margin-top:6px; }
+  /* Git tab */
+  .gitline { font-size:12.5px; margin:4px 0 8px; line-height:1.4; word-break:break-word; }
+  .gitfile { display:flex; align-items:center; gap:6px; font-size:12.5px; padding:3px 0;
+             border-bottom:1px solid var(--soft-line); }
+  .gitfile .path { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .gitfile.secret { color:var(--bad); font-weight:600; }
+  .gitlabel { flex:0 0 auto; font-size:11px; padding:0 6px; border-radius:8px; background:var(--code-bg);
+              color:var(--muted); font-weight:400; }
+  .gitlabel.secret { background:var(--err-bg); color:var(--bad); }
+  .gitcommit { font-size:12.5px; padding:4px 0; border-bottom:1px solid var(--soft-line); line-height:1.4; }
+  .gitcommit .hash { font-family: Consolas, monospace; color:var(--muted); margin-right:6px; }
+  .gitfiles { max-height:200px; overflow:auto; margin-bottom:8px; }
   /* Usage tab: bars for requests per day, models and tools */
   .usagerow { display:flex; align-items:center; gap:6px; font-size:12px; padding:2px 0; }
   .usagerow .lbl { flex:0 0 74px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -309,6 +337,7 @@
       <button id="tabbtn-notes">Notes</button>
       <button id="tabbtn-files">Files</button>
       <button id="tabbtn-run">Run</button>
+      <button id="tabbtn-git">Git</button>
       <button id="tabbtn-usage">Usage</button>
       <button id="tabbtn-settings">Settings</button>
     </div>
@@ -344,9 +373,19 @@
     </div>
 
     <div id="tab-files" hidden>
-      <button id="filesRefresh" class="small wide">Refresh</button>
-      <input id="fileFilter" class="searchbox" type="search" placeholder="Filter files..." maxlength="100">
-      <div id="files" class="muted">loading...</div>
+      <div class="subtabs">
+        <button id="filesViewFiles" class="active">Files</button>
+        <button id="filesViewHistory" title="Earlier versions of the files the agent changed">History</button>
+      </div>
+      <div id="filesPane">
+        <button id="filesRefresh" class="small wide">Refresh</button>
+        <input id="fileFilter" class="searchbox" type="search" placeholder="Filter files..." maxlength="100">
+        <div id="files" class="muted">loading...</div>
+      </div>
+      <div id="historyPane" hidden>
+        <button id="historyRefresh" class="small wide">Refresh</button>
+        <div id="historyBox" class="muted">loading...</div>
+      </div>
     </div>
 
     <div id="tab-run" hidden>
@@ -363,9 +402,36 @@
         <button id="runOpen" class="small" hidden title="Open the running project in a new tab">Open</button>
         <button id="runTest" class="small" hidden title="Open it in a headless browser at phone size and report errors">Test page</button>
       </div>
+      <div id="runGit" class="muted" style="margin-bottom:6px" hidden></div>
       <div id="runStatus" class="runstatus muted"></div>
       <pre id="runLog" class="runlog" hidden></pre>
       <div id="runTestOut"></div>
+    </div>
+
+    <div id="tab-git" hidden>
+      <div class="muted">See what changed in a project, write a commit message, commit and push. Each commit and push asks you to confirm first.</div>
+      <div class="runrow" style="margin-top:8px">
+        <select id="gitProject" title="Choose a project folder"></select>
+        <button id="gitRefresh" class="small">Refresh</button>
+      </div>
+      <div id="gitNote" class="muted"></div>
+      <div id="gitBody" hidden>
+        <div id="gitHead" class="gitline"></div>
+        <div id="gitFiles" class="gitfiles"></div>
+        <div id="gitWarn" class="panelmsg error" hidden></div>
+        <textarea id="gitMsg" class="field" rows="2" maxlength="2000" placeholder="Commit message"></textarea>
+        <div class="runrow">
+          <button id="gitSuggest" class="small" title="Make a message from the names of the changed files">Suggest from files</button>
+          <button id="gitSuggestAi" class="small" title="The model writes it from the file names only (file contents are never sent)">Suggest with AI</button>
+        </div>
+        <div class="runrow">
+          <button id="gitCommit" class="primary small">Commit</button>
+          <button id="gitPush" class="small">Push</button>
+        </div>
+        <div id="gitHint" class="muted" style="margin-bottom:8px"></div>
+        <h3>Recent commits</h3>
+        <div id="gitLog"></div>
+      </div>
     </div>
 
     <div id="tab-usage" hidden>
@@ -440,11 +506,15 @@ let voiceState = "";  // "", "listening" or "transcribing"
 let currentTab = "tasks";
 let routingState = null, modelNames = [];
 const runState = { project: "", after: 0, timer: null, projects: [], running: false, url: "" };
+const gitState = { project: "", data: null, msgTouched: false };
+const hist = { view: "files", path: "" };  // Files tab: the file list, or the history of saved versions
 const collapsedFolders = new Set();  // folders closed in the Files panel
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const INSTR_MAX = 1500;
-const TABS = ["tasks", "notes", "files", "run", "usage", "settings"];
+const TABS = ["tasks", "notes", "files", "run", "git", "usage", "settings"];
 const RUN_LOG_MAX_CHARS = 60000;
+// The line the agent puts before the changed lines of an overwrite (must match DIFF_MARKER in agent.py).
+const DIFF_MARKER = "Changes (only the changed lines are shown, + added, - removed):";
 // A paste longer than this becomes a "PASTED" card instead of filling the message box.
 const PASTE_MIN_CHARS = 1500, PASTE_MIN_LINES = 25;
 const CODE_HINT_RE = /[{};=<>]|\bimport\b|\bdef\b|\bfunction\b/;
@@ -821,6 +891,38 @@ function renderMarkdown(text) {
   return root;
 }
 
+// ---------- colored changed lines (approval cards and History > Compare) ----------
+function diffClass(line) {
+  if (line.indexOf("@@") === 0) return "dhunk";
+  if (line.charAt(0) === "+") return "dadd";
+  if (line.charAt(0) === "-") return "ddel";
+  return "";
+}
+
+function diffLine(text, cls) {
+  const d = document.createElement("div");
+  d.className = "dl" + (cls ? " " + cls : "");
+  d.textContent = text === "" ? " " : text;
+  return d;
+}
+
+// The text of an approval card. When the agent overwrites a file, the lines after DIFF_MARKER are the
+// changed lines ("| +added", "| -removed"): show them in green and red.
+function fillApprovalText(pre, text) {
+  const lines = text.split("\n");
+  const at = lines.indexOf(DIFF_MARKER);
+  if (at < 0) { pre.textContent = text; return; }
+  pre.appendChild(document.createTextNode(lines.slice(0, at + 1).join("\n") + "\n"));
+  lines.slice(at + 1).forEach(function (raw) {
+    if (raw.indexOf("| ") === 0) {
+      const line = raw.slice(2);
+      pre.appendChild(diffLine(line, diffClass(line)));
+    } else {
+      pre.appendChild(diffLine(raw, "dmore"));  // for example "... (12 more changed lines not shown)"
+    }
+  });
+}
+
 // ---------- pasted-text cards ----------
 // The preview text of a card; in code, words like import, def and function are highlighted.
 function fillPreview(el, text) {
@@ -1046,7 +1148,7 @@ function approvalCard(ev) {
   title.className = "cardtitle";
   title.textContent = "Approval needed";
   const pre = document.createElement("pre");
-  pre.textContent = ev.text;
+  fillApprovalText(pre, ev.text);
   const bar = document.createElement("div");
   bar.className = "row";
   card.appendChild(title);
@@ -1521,8 +1623,7 @@ async function loadState() {
       $("instr").value = s.instructions || "";
       updateInstrCount();
     }
-    routingState = s.routing || routingState;
-    if (!$("tab-settings").hidden === false) applyRouting();
+    routingState = s.routing || routingState;  // the routing menus are filled when Settings is opened
     $("fallbackInfo").textContent = (s.fallback_models && s.fallback_models.length)
       ? "If a model is busy or out of quota, the agent switches to: " + s.fallback_models.join(", ") + "."
       : "Automatic model fallback is off (GEMINI_FALLBACK_MODELS is empty in .env).";
@@ -1790,11 +1891,23 @@ $("fileFilter").addEventListener("input", function () {
   filesTimer = setTimeout(loadFiles, 250);
 });
 
+// A window over the page. build(body) fills it; onDownload (optional) shows the Download button.
+function openModalNode(title, build, onDownload) {
+  $("modaltitle").textContent = title;
+  const body = $("modalbody");
+  body.innerHTML = "";
+  build(body);
+  $("modalDownload").hidden = !onDownload;
+  $("modalDownload").onclick = onDownload || null;
+  $("modal").hidden = false;
+}
+
 async function openPreview(f) {
   $("modaltitle").textContent = f.path;
   const body = $("modalbody");
   body.textContent = "Loading...";
   $("modal").hidden = false;
+  $("modalDownload").hidden = false;
   $("modalDownload").onclick = function () { downloadFile(f.path, f.name); };
   try {
     const p = await api("/api/files/preview?path=" + encodeURIComponent(f.path));
@@ -1820,6 +1933,202 @@ $("modalClose").onclick = closePreview;
 $("modal").addEventListener("click", function (e) { if (e.target === $("modal")) closePreview(); });
 document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$("modal").hidden) closePreview(); });
 
+// ---------- history: earlier versions of the files the agent changed ----------
+function setFilesView(view) {
+  hist.view = view;
+  $("filesPane").hidden = view !== "files";
+  $("historyPane").hidden = view !== "history";
+  $("filesViewFiles").classList.toggle("active", view === "files");
+  $("filesViewHistory").classList.toggle("active", view === "history");
+  if (view === "files") loadFiles();
+  else loadHistory();
+}
+$("filesViewFiles").onclick = function () { setFilesView("files"); };
+$("filesViewHistory").onclick = function () { setFilesView("history"); };
+
+async function loadHistory() {
+  if (hist.path) { openHistoryFile(hist.path); return; }
+  const box = $("historyBox");
+  try {
+    const d = await api("/api/history/files");
+    renderHistoryFiles(d);
+  } catch (e) {
+    box.className = "muted";
+    box.textContent = "Could not load the history: " + e.message;
+  }
+}
+$("historyRefresh").onclick = loadHistory;
+
+function renderHistoryFiles(d) {
+  const box = $("historyBox");
+  box.innerHTML = "";
+  if (!d.files.length) {
+    box.className = "muted";
+    box.textContent = "No saved versions yet. Every time the agent changes a file, the old version is kept here and you can bring it back.";
+    return;
+  }
+  box.className = "";
+  const stats = document.createElement("div");
+  stats.className = "histstats";
+  stats.textContent = d.stats.versions + " saved versions of " + d.stats.files + " files (" + formatSize(d.stats.bytes) + "). Open a file to see its earlier versions.";
+  box.appendChild(stats);
+  d.files.forEach(function (f) {
+    const row = document.createElement("div");
+    row.className = "histrow clickable";
+    const icon = document.createElement("span");
+    icon.className = "fileicon";
+    icon.textContent = fileIcon(f.name);
+    const label = document.createElement("div");
+    label.className = "histlabel";
+    const name = document.createElement("div");
+    name.className = "filename";
+    name.textContent = f.name;
+    name.title = f.path;
+    const meta = document.createElement("div");
+    meta.className = "filemeta";
+    meta.textContent = f.count + (f.count === 1 ? " version" : " versions") + " \u00b7 last changed " + formatWhen(f.last);
+    label.appendChild(name);
+    label.appendChild(meta);
+    row.appendChild(icon);
+    row.appendChild(label);
+    row.onclick = function () { openHistoryFile(f.path); };
+    box.appendChild(row);
+  });
+}
+
+async function openHistoryFile(path) {
+  hist.path = path;
+  const box = $("historyBox");
+  try {
+    const d = await api("/api/history?path=" + encodeURIComponent(path));
+    if (hist.path !== path) return;
+    renderVersions(path, d.entries);
+  } catch (e) {
+    box.className = "muted";
+    box.textContent = "Could not load the versions: " + e.message;
+  }
+}
+
+function renderVersions(path, entries) {
+  const box = $("historyBox");
+  box.innerHTML = "";
+  box.className = "";
+  const head = document.createElement("div");
+  head.className = "histhead";
+  const back = document.createElement("button");
+  back.className = "small";
+  back.textContent = "\u2190 Back";
+  back.onclick = function () { hist.path = ""; loadHistory(); };
+  const name = document.createElement("div");
+  name.className = "filename";
+  name.textContent = path;
+  name.title = path;
+  head.appendChild(back);
+  head.appendChild(name);
+  box.appendChild(head);
+  if (!entries.length) {
+    const none = document.createElement("div");
+    none.className = "muted";
+    none.textContent = "No saved versions of this file.";
+    box.appendChild(none);
+    return;
+  }
+  const note = document.createElement("div");
+  note.className = "histstats";
+  note.textContent = "Each line is the file as it was just BEFORE the agent changed it. Newest first.";
+  box.appendChild(note);
+  entries.forEach(function (e) {
+    const row = document.createElement("div");
+    row.className = "histrow";
+    const label = document.createElement("div");
+    label.className = "histlabel";
+    const title = document.createElement("div");
+    title.className = "filename";
+    title.textContent = e.existed ? "Before the change on " + formatWhen(e.time)
+                                  : "The file did not exist before " + formatWhen(e.time);
+    const meta = document.createElement("div");
+    meta.className = "filemeta";
+    meta.textContent = (e.tool || "") + (e.existed ? " \u00b7 " + formatSize(e.size) : "") + (!e.kept ? " \u00b7 too large to keep" : "");
+    label.appendChild(title);
+    label.appendChild(meta);
+    const view = document.createElement("button");
+    view.className = "iconbtn viewbtn";
+    view.title = "Preview this version";
+    view.textContent = "\uD83D\uDC41";
+    view.onclick = function () { showVersion(e); };
+    const cmp = document.createElement("button");
+    cmp.className = "iconbtn viewbtn";
+    cmp.title = "Compare with the file as it is now";
+    cmp.textContent = "\u21C4";
+    cmp.onclick = function () { showCompare(e); };
+    const res = document.createElement("button");
+    res.className = "iconbtn viewbtn";
+    res.title = e.kept ? "Restore this version" : "This version was too large to keep";
+    res.textContent = "\u21A9";
+    res.disabled = !e.kept;
+    res.onclick = function () { restoreVersion(e); };
+    row.appendChild(label);
+    row.appendChild(view);
+    row.appendChild(cmp);
+    row.appendChild(res);
+    box.appendChild(row);
+  });
+}
+
+async function showVersion(e) {
+  try {
+    const p = await api("/api/history/" + e.id + "/preview");
+    openModalNode(e.path + " \u00b7 before " + formatWhen(e.time), function (body) {
+      if (p.kind === "text") {
+        const pre = document.createElement("pre");
+        pre.textContent = p.text + (p.truncated ? "\n\n... (shortened)" : "");
+        body.appendChild(pre);
+      } else {
+        body.textContent = p.note || "No preview for this version.";
+      }
+    }, null);
+  } catch (err) {
+    panelNotice(err.message, "error");
+  }
+}
+
+async function showCompare(e) {
+  try {
+    const r = await api("/api/history/" + e.id + "/diff");
+    openModalNode("Compare: " + e.path, function (body) {
+      if (r.kind === "diff") {
+        const sum = document.createElement("div");
+        sum.className = "diffsum";
+        sum.textContent = "Restoring this version would add " + r.added + " line(s) (green) and remove " + r.removed +
+                          " line(s) (red), compared with the file as it is now.";
+        body.appendChild(sum);
+        const pre = document.createElement("pre");
+        r.lines.forEach(function (line) { pre.appendChild(diffLine(line, diffClass(line))); });
+        body.appendChild(pre);
+      } else {
+        body.textContent = r.note || "Nothing to compare.";
+      }
+    }, null);
+  } catch (err) {
+    panelNotice(err.message, "error");
+  }
+}
+
+async function restoreVersion(e) {
+  const question = e.existed
+    ? "Restore " + e.path + " to the version from before " + formatWhen(e.time) + "?\n\nThe file as it is now is saved first, so you can undo this restore too."
+    : "Delete " + e.path + "?\n\nThis file did not exist before the change from " + formatWhen(e.time) + ". The current content is saved first, so you can bring it back from this list.";
+  if (!confirm(question)) return;
+  try {
+    const r = await api("/api/history/" + e.id + "/restore", { method: "POST", body: "{}" });
+    panelNotice(r.status === "deleted" ? "The file was removed." : "The file was restored.", "ok");
+    loadHistory();
+    if (!$("filesPane").hidden) loadFiles();
+  } catch (err) {
+    panelNotice(err.message, "error");
+  }
+}
+
 // ---------- run tab: start a project, live log, open it, test it ----------
 function currentProject() {
   const name = runState.project;
@@ -1838,6 +2147,25 @@ function updateRunButtons() {
   $("runStop").hidden = !runState.running;
   $("runOpen").hidden = !(runState.running && runState.url);
   $("runTest").hidden = !(runState.running && runState.url);
+}
+
+// A line under the Run buttons: is this project a Git repository? (opens the Git tab for it)
+function updateRunGit() {
+  const p = currentProject();
+  const el = $("runGit");
+  el.innerHTML = "";
+  if (!p) { el.hidden = true; return; }
+  el.hidden = false;
+  if (p.git) {
+    el.appendChild(document.createTextNode("Git repository. "));
+    const b = document.createElement("button");
+    b.className = "small";
+    b.textContent = "Open Git tab";
+    b.onclick = function () { gitState.project = p.name; showTab("git"); };
+    el.appendChild(b);
+  } else {
+    el.textContent = "Not a Git repository.";
+  }
 }
 
 function fillRunOptions() {
@@ -1871,6 +2199,7 @@ async function loadProjects() {
       runState.project = "";
       fillRunOptions();
       updateRunButtons();
+      updateRunGit();
       $("runLog").hidden = true;
       setRunStatus("No project folders yet. Ask the agent to build a project, or create a folder inside the workspace.", false);
       return;
@@ -1895,6 +2224,7 @@ function changeProject(name, reset) {
   runState.project = name;
   fillRunOptions();
   updateRunButtons();
+  updateRunGit();
   refreshRun();
 }
 $("runProject").onchange = function () { changeProject($("runProject").value, true); };
@@ -2055,6 +2385,224 @@ $("runTest").onclick = async function () {
   btn.disabled = false;
 };
 
+// ---------- git tab: changed files, commit message, commit, push ----------
+function setGitNote(text) {
+  $("gitNote").textContent = text || "";
+}
+
+async function loadGitProjects() {
+  try {
+    const d = await api("/api/projects");
+    const sel = $("gitProject");
+    const keep = gitState.project;
+    sel.innerHTML = "";
+    d.projects.forEach(function (p) {
+      const o = document.createElement("option");
+      o.value = p.name;
+      o.textContent = p.name + (p.git ? "" : "  (no git)");
+      sel.appendChild(o);
+    });
+    if (!d.projects.length) {
+      gitState.project = "";
+      $("gitBody").hidden = true;
+      setGitNote("No project folders yet.");
+      return;
+    }
+    const names = d.projects.map(function (p) { return p.name; });
+    let pick = keep;
+    if (names.indexOf(pick) < 0) {
+      const withGit = d.projects.find(function (p) { return p.git; });
+      pick = withGit ? withGit.name : names[0];
+    }
+    sel.value = pick;
+    if (pick !== gitState.project) gitState.msgTouched = false;
+    gitState.project = pick;
+    loadGit();
+  } catch (e) {
+    setGitNote("Could not load the projects: " + e.message);
+  }
+}
+
+async function loadGit() {
+  const name = gitState.project;
+  if (!name) return;
+  setGitNote("Loading...");
+  try {
+    const st = await api("/api/projects/" + encodeURIComponent(name) + "/git");
+    if (name !== gitState.project) return;  // another project was chosen while loading
+    gitState.data = st;
+    renderGit(st);
+  } catch (e) {
+    $("gitBody").hidden = true;
+    setGitNote("Could not read Git: " + e.message);
+  }
+}
+
+function renderGit(st) {
+  if (!st.is_repo) {
+    $("gitBody").hidden = true;
+    setGitNote(st.note || "This folder is not a Git repository.");
+    return;
+  }
+  setGitNote("");
+  $("gitBody").hidden = false;
+
+  let head = st.detached ? "Not on a branch (detached HEAD)" : "Branch " + (st.branch || "?");
+  if (st.upstream) head += " \u2192 " + st.upstream;
+  if (st.ahead) head += " \u00b7 " + st.ahead + " commit" + (st.ahead === 1 ? "" : "s") + " not pushed";
+  if (st.behind) head += " \u00b7 " + st.behind + " behind the remote";
+  if (!st.has_commits) head += " \u00b7 no commits yet";
+  $("gitHead").textContent = head;
+
+  const filesBox = $("gitFiles");
+  filesBox.innerHTML = "";
+  if (st.clean) {
+    const clean = document.createElement("div");
+    clean.className = "muted";
+    clean.textContent = "Nothing to commit: no changed files.";
+    filesBox.appendChild(clean);
+  }
+  st.files.forEach(function (f) {
+    const row = document.createElement("div");
+    row.className = "gitfile" + (f.sensitive ? " secret" : "");
+    const label = document.createElement("span");
+    label.className = "gitlabel" + (f.sensitive ? " secret" : "");
+    label.textContent = f.sensitive ? "secret?" : f.label;
+    const path = document.createElement("span");
+    path.className = "path";
+    path.textContent = f.path;
+    path.title = f.path;
+    row.appendChild(label);
+    row.appendChild(path);
+    filesBox.appendChild(row);
+  });
+  if (st.total_files > st.files.length) {
+    const more = document.createElement("div");
+    more.className = "muted";
+    more.textContent = "...and " + (st.total_files - st.files.length) + " more changed files.";
+    filesBox.appendChild(more);
+  }
+
+  const warn = $("gitWarn");
+  if (st.sensitive && st.sensitive.length) {
+    warn.hidden = false;
+    warn.textContent = "These files look like secrets, so committing is blocked: " + st.sensitive.slice(0, 5).join(", ") +
+                       ". Add them to .gitignore (or delete them) first.";
+  } else {
+    warn.hidden = true;
+  }
+
+  if (!gitState.msgTouched && !$("gitMsg").value.trim()) $("gitMsg").value = st.suggested || "";
+
+  $("gitCommit").disabled = st.clean || !!(st.sensitive && st.sensitive.length);
+  const canPush = st.has_commits && !st.detached && st.remotes && st.remotes.length > 0;
+  $("gitPush").disabled = !canPush;
+  let hint = "";
+  if (!st.remotes || !st.remotes.length) hint = "No remote yet. In Command Prompt, inside the project folder: git remote add origin <your repository address>";
+  else if (!st.has_commits) hint = "Commit first, then push.";
+  else if (st.behind) hint = "The remote has newer commits. Pull them in Command Prompt first (git pull). This panel never forces a push.";
+  else if (st.ahead) hint = st.ahead + " commit" + (st.ahead === 1 ? " is" : "s are") + " waiting to be pushed.";
+  else if (st.clean) hint = "Everything is committed and pushed.";
+  $("gitHint").textContent = hint;
+
+  const log = $("gitLog");
+  log.innerHTML = "";
+  if (!st.commits || !st.commits.length) {
+    const none = document.createElement("div");
+    none.className = "muted";
+    none.textContent = "No commits yet.";
+    log.appendChild(none);
+  } else {
+    st.commits.forEach(function (c) {
+      const row = document.createElement("div");
+      row.className = "gitcommit";
+      const hash = document.createElement("span");
+      hash.className = "hash";
+      hash.textContent = c.hash;
+      row.appendChild(hash);
+      row.appendChild(document.createTextNode(c.message));
+      const when = document.createElement("div");
+      when.className = "muted";
+      when.textContent = c.author + " \u00b7 " + c.when;
+      row.appendChild(when);
+      log.appendChild(row);
+    });
+  }
+}
+
+$("gitProject").onchange = function () {
+  gitState.project = $("gitProject").value;
+  gitState.msgTouched = false;
+  $("gitMsg").value = "";
+  loadGit();
+};
+$("gitRefresh").onclick = loadGit;
+$("gitMsg").addEventListener("input", function () { gitState.msgTouched = true; });
+
+async function suggestMessage(ai) {
+  const name = gitState.project;
+  if (!name) return;
+  const btn = ai ? $("gitSuggestAi") : $("gitSuggest");
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = ai ? "Writing..." : old;
+  try {
+    const r = await api("/api/projects/" + encodeURIComponent(name) + "/git/suggest", {
+      method: "POST", body: JSON.stringify({ ai: !!ai }) });
+    $("gitMsg").value = r.message || "";
+    gitState.msgTouched = true;
+    if (r.note) panelNotice(r.note);
+    else panelNotice(r.source === "ai" ? "The model wrote this message from the file names." : "Message made from the file names.", "ok");
+  } catch (e) {
+    panelNotice(e.message, "error");
+  }
+  btn.textContent = old;
+  btn.disabled = false;
+}
+$("gitSuggest").onclick = function () { suggestMessage(false); };
+$("gitSuggestAi").onclick = function () { suggestMessage(true); };
+
+$("gitCommit").onclick = async function () {
+  const name = gitState.project;
+  const st = gitState.data;
+  const message = $("gitMsg").value.trim();
+  if (!name || !st) return;
+  if (!message) { panelNotice("Write a commit message first.", "error"); $("gitMsg").focus(); return; }
+  if (!confirm("Commit " + st.total_files + " changed file" + (st.total_files === 1 ? "" : "s") + " in \"" + name + "\" with this message?\n\n" + message + "\n\nEverything not listed in .gitignore is included.")) return;
+  const btn = $("gitCommit");
+  btn.disabled = true;
+  try {
+    await api("/api/projects/" + encodeURIComponent(name) + "/git/commit", {
+      method: "POST", body: JSON.stringify({ message: message, confirmed: true }) });
+    $("gitMsg").value = "";
+    gitState.msgTouched = false;
+    panelNotice("Committed.", "ok");
+  } catch (e) {
+    panelNotice(e.message, "error");
+  }
+  await loadGit();
+};
+
+$("gitPush").onclick = async function () {
+  const name = gitState.project;
+  const st = gitState.data;
+  if (!name || !st) return;
+  const target = st.upstream || ((st.remotes && st.remotes[0] ? st.remotes[0] : "the remote") + "/" + (st.branch || ""));
+  if (!confirm("Push the committed changes of \"" + name + "\" to " + target + "?\n\nThis sends your code to that repository. It never forces a push.")) return;
+  const btn = $("gitPush");
+  btn.disabled = true;
+  btn.textContent = "Pushing...";
+  try {
+    await api("/api/projects/" + encodeURIComponent(name) + "/git/push", {
+      method: "POST", body: JSON.stringify({ confirmed: true }) });
+    panelNotice("Pushed.", "ok");
+  } catch (e) {
+    panelNotice(e.message, "error");
+  }
+  btn.textContent = "Push";
+  await loadGit();
+};
+
 // ---------- usage tab ----------
 function sumField(days, field) {
   const total = {};
@@ -2143,9 +2691,10 @@ function showTab(name) {
     $("tabbtn-" + t).classList.toggle("active", t === name);
   });
   try { localStorage.setItem("tab", name); } catch (e) {}
-  if (name === "files") loadFiles();
+  if (name === "files") { if (hist.view === "history") loadHistory(); else loadFiles(); }
   if (name === "usage") loadUsage();
   if (name === "settings") applyRouting();
+  if (name === "git") loadGitProjects();
   if (name === "run") { loadProjects(); startRunPolling(); }
   else stopRunPolling();
 }
@@ -2166,8 +2715,9 @@ async function poll() {
       if (lastBusy && !busy) {
         loadState();
         loadChats();
-        if (!$("tab-files").hidden) loadFiles();
+        if (!$("tab-files").hidden) { if (hist.view === "history") loadHistory(); else loadFiles(); }
         if (!$("tab-usage").hidden) loadUsage();
+        if (!$("tab-git").hidden) loadGit();
       }
       lastBusy = busy;
       updateEditButton();
