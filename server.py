@@ -31,6 +31,9 @@ import agent
 import apptester
 import filehistory
 import gitpanel
+import knowledge
+import modes
+import projectmemory
 import projectrunner
 import uploads
 
@@ -80,7 +83,7 @@ CHAT_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")  # strict: ids become file
 # Log lines that record something the agent (or you, with a button) actually did. They are kept when a
 # chat is summarized for the model.
 ACTION_PREFIXES = ("[tool]", "[ran]", "[fetched]", "[created]", "[tested]", "[restored", "[committed",
-                   "[pushed", "[task", "[memory")
+                   "[pushed", "[knowledge", "[task", "[memory")
 # Log lines that are never shown in the chat, and ones that are kept but hidden.
 NOISE_PREFIXES = ("[waiting for model", "[model replied")
 QUIET_PREFIXES = ("[tool]", "[created]")
@@ -90,6 +93,7 @@ MAX_RESTORE_BYTES = 300 * 1024 * 1024
 MAX_RESTORE_UNPACKED = 600 * 1024 * 1024
 MAX_RESTORE_FILE = 50 * 1024 * 1024
 MAX_BACKUP_FILE = 20 * 1024 * 1024
+MAX_BACKUP_KNOWLEDGE = 45 * 1024 * 1024  # the knowledge base index (a bigger one is not put in a backup)
 MAX_BACKUP_WORKSPACE = 150 * 1024 * 1024
 RESTORE_WORKSPACE_EXTENSIONS = set(agent.ALLOWED_WRITE_EXTENSIONS) | {
     ".docx", ".xlsx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -142,6 +146,20 @@ def make_preview(text: str) -> str:
     """The short piece of a pasted text that is shown on its card in the chat."""
     flat = " ".join(str(text).split())
     return flat[:PASTE_PREVIEW_CHARS] + ("..." if len(flat) > PASTE_PREVIEW_CHARS else "")
+
+
+async def read_limited_body(request: Request, limit: int):
+    """The request body as bytes, or None when it is bigger than `limit`."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks, total = [], 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------
@@ -549,6 +567,7 @@ def build_context(events: list):
 def reset_chat_locked() -> None:
     """Start an empty chat. The caller must already hold state.lock."""
     agent.clear_pending()
+    agent.reset_focus()  # no project's notes carry over into the new chat
     state.chat_id = new_chat_id()
     state.chat_created = now_iso()
     state.chat_title = None
@@ -756,10 +775,15 @@ def build_backup(zip_path: Path) -> None:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in CHATS_DIR.glob("*.json"):
             zf.write(path, "chats/" + path.name)
-        for name in ("tasks.json", "memory.json", "settings.json"):
+        for name in ("tasks.json", "memory.json", "settings.json", "projectmem.json"):
             source = agent.BASE_DIR / name
             if source.exists():
                 zf.write(source, name)
+        try:  # the knowledge base (the extracted text of your documents, not the original files)
+            if knowledge.INDEX_FILE.exists() and knowledge.INDEX_FILE.stat().st_size <= MAX_BACKUP_KNOWLEDGE:
+                zf.write(knowledge.INDEX_FILE, "knowledge/index.json")
+        except OSError:
+            pass
         total = 0
         for path in iter_workspace_files():  # without the internal files of git and other tools
             relative = path.relative_to(agent.WORKSPACE).as_posix()
@@ -782,6 +806,54 @@ def _valid_task(t) -> bool:
 
 def _valid_note(n) -> bool:
     return isinstance(n, dict) and isinstance(n.get("id"), int) and isinstance(n.get("fact"), str)
+
+
+def _clean_project_memory(data):
+    """The project notes of a backup, checked note by note. None when the file is not a notes file."""
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), dict):
+        return None
+    out = {}
+    for name, notes in data["projects"].items():
+        if not projectmemory._valid_name(str(name)) or not isinstance(notes, list):
+            continue
+        kept = []
+        for n in notes[:projectmemory.MAX_NOTES_PER_PROJECT]:
+            if (isinstance(n, dict) and isinstance(n.get("id"), int) and isinstance(n.get("text"), str)
+                    and n["text"].strip() and n.get("kind") in projectmemory.KINDS):
+                kept.append({"id": n["id"], "kind": n["kind"], "text": n["text"][:projectmemory.MAX_NOTE_CHARS],
+                             "saved": str(n.get("saved") or "")[:10]})
+        if kept:
+            out[str(name)] = kept
+        if len(out) >= projectmemory.MAX_PROJECTS:
+            break
+    return {"projects": out}
+
+
+def _clean_knowledge(data):
+    """The knowledge base of a backup, checked document by document. None when it is not a knowledge file."""
+    if not isinstance(data, dict) or not isinstance(data.get("docs"), list):
+        return None
+    docs, total = [], 0
+    for d in data["docs"][:knowledge.MAX_DOCS]:
+        if not (isinstance(d, dict) and isinstance(d.get("id"), str) and isinstance(d.get("name"), str)
+                and isinstance(d.get("chunks"), list)):
+            continue
+        chunks = []
+        for c in d["chunks"][:knowledge.MAX_CHUNKS_PER_DOC]:
+            if not (isinstance(c, dict) and isinstance(c.get("text"), str) and c["text"].strip()):
+                continue
+            if total + len(chunks) >= knowledge.MAX_TOTAL_CHUNKS:
+                break
+            page = c.get("page")
+            chunks.append({"page": page if isinstance(page, int) else None,
+                           "text": c["text"][:knowledge.CHUNK_CHARS * 2]})
+        if chunks:
+            total += len(chunks)
+            docs.append({"id": d["id"][:16], "name": d["name"][:100], "kind": str(d.get("kind") or "")[:10],
+                         "size": int(d["size"]) if isinstance(d.get("size"), int) else 0,
+                         "added": str(d.get("added") or "")[:40], "truncated": bool(d.get("truncated")),
+                         "chunks": chunks})
+    return docs
 
 
 def restore_backup(data: bytes) -> str:
@@ -837,10 +909,30 @@ def restore_backup(data: bytes) -> str:
                     agent.update_settings({"instructions": saved["instructions"][:agent.MAX_INSTRUCTIONS_CHARS]})
                 if isinstance(saved.get("model"), str) and agent.MODEL_NAME_RE.match(saved["model"]):
                     agent.set_model(saved["model"])
+                if isinstance(saved.get("mode"), str):
+                    agent.set_mode(saved["mode"])  # an unknown mode name is simply ignored
                 if isinstance(saved.get("routing"), bool):
                     agent.set_routing(saved["routing"], str(saved.get("chat_model") or ""),
                                       str(saved.get("code_model") or ""))
                 extras.append("settings")
+        elif name == "projectmem.json":
+            try:
+                cleaned = _clean_project_memory(json.loads(raw.decode("utf-8")))
+            except ValueError:
+                continue
+            if cleaned is not None:
+                with projectmemory.LOCK:
+                    projectmemory._save(cleaned)
+                extras.append("project notes")
+        elif name == "knowledge/index.json":
+            try:
+                cleaned_docs = _clean_knowledge(json.loads(raw.decode("utf-8")))
+            except ValueError:
+                continue
+            if cleaned_docs is not None:
+                with knowledge.LOCK:
+                    knowledge._save_docs(cleaned_docs)
+                extras.append("knowledge base")
         elif parts[0] == "workspace" and len(parts) > 1:
             try:
                 target = agent._safe_path("/".join(parts[1:]))
@@ -908,6 +1000,17 @@ def ai_commit_message(status: dict) -> str:
     return first.strip("`'\" ")[:100]
 
 
+def project_notes_overview() -> list:
+    """Every project folder with how many notes it has, then any project that has notes but no folder."""
+    counts = {p["project"]: p["count"] for p in projectmemory.all_projects()}
+    folders = agent._project_folders()
+    items = [{"name": f, "count": counts.get(f, 0), "exists": True} for f in folders]
+    for name, count in sorted(counts.items()):
+        if name not in folders:
+            items.append({"name": name, "count": count, "exists": False})
+    return items
+
+
 # ---------------------------------------------------------------
 # The web app
 # ---------------------------------------------------------------
@@ -966,14 +1069,32 @@ class NoteIn(BaseModel):
     fact: str
 
 
+class ProjectNoteIn(BaseModel):
+    text: str
+    kind: str = "note"
+
+
 class ModelIn(BaseModel):
     model: str
+
+
+class ModeIn(BaseModel):
+    mode: str
 
 
 class RoutingIn(BaseModel):
     enabled: bool = False
     chat_model: str = ""
     code_model: str = ""
+
+
+class KnowledgeTextIn(BaseModel):
+    title: str = ""
+    text: str
+
+
+class KnowledgeFileIn(BaseModel):
+    path: str
 
 
 class StartIn(BaseModel):
@@ -1086,6 +1207,8 @@ def get_state():
     tasks = agent.list_tasks("open")
     return {
         "model": agent.MODEL,
+        "mode": agent.get_mode(),
+        "modes": modes.list_modes(),
         "web_search": agent.ENABLE_WEB_SEARCH,
         "user_name": user_name(),
         "today": tasks["today"],
@@ -1099,7 +1222,7 @@ def get_state():
     }
 
 
-# ----- model, routing and instructions -----
+# ----- model, mode, routing and instructions -----
 @app.get("/api/models")
 def get_models():
     return {"current": agent.MODEL, "models": agent.list_models()}
@@ -1120,6 +1243,34 @@ def choose_model(body: ModelIn):
         state.previous_id = None
         state.chain_model = None
         state.resume_context = build_context(state.events)
+    return result
+
+
+@app.get("/api/mode")
+def get_mode_info():
+    return {"mode": agent.get_mode(), "modes": modes.list_modes()}
+
+
+@app.post("/api/mode")
+def choose_mode(body: ModeIn):
+    """Change the mode (the agent's working style and tools). The chat continues from a written summary,
+    because the set of tools the model is offered changes."""
+    if body.mode not in modes.MODES:
+        return JSONResponse({"error": "That mode does not exist."}, status_code=400)
+    with state.lock:
+        if state.busy:
+            return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
+    if body.mode == agent.get_mode():
+        return {"mode": body.mode, "unchanged": True}
+    result = agent.set_mode(body.mode)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    with state.lock:
+        agent.clear_pending()
+        state.previous_id = None
+        state.chain_model = None
+        state.resume_context = build_context(state.events)
+    push("log", text=f"  [mode changed to {modes.MODES[body.mode]['label']}]")
     return result
 
 
@@ -1151,6 +1302,119 @@ def get_usage(days: int = 14):
     return {"today": agent.get_usage_today(), "days": agent.get_usage_history(days),
             "fallback_models": agent.FALLBACK_MODELS, "routing": agent.get_routing(),
             "last_model": agent.LAST_MODEL["name"]}
+
+
+# ----- project notes (what the agent remembers about each project) -----
+@app.get("/api/projectnotes")
+def project_notes_list():
+    return {"projects": project_notes_overview(), "kinds": projectmemory.kinds()}
+
+
+@app.get("/api/projectnotes/{name}")
+def project_notes_get(name: str):
+    if not projectmemory._valid_name(name):
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    return {"project": name, "notes": projectmemory.list_notes(name), "kinds": projectmemory.kinds()}
+
+
+@app.post("/api/projectnotes/{name}")
+def project_notes_add(name: str, body: ProjectNoteIn):
+    folder = agent._canonical_project(name)
+    if folder is None:
+        return JSONResponse({"error": "There is no project folder with that name in the workspace."},
+                            status_code=404)
+    result = projectmemory.add_note(folder, body.text, body.kind)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+@app.put("/api/projectnotes/{name}/{note_id}")
+def project_notes_edit(name: str, note_id: int, body: ProjectNoteIn):
+    if not projectmemory._valid_name(name):
+        return JSONResponse({"error": "No such project."}, status_code=404)
+    result = projectmemory.update_note(name, note_id, body.text, body.kind)
+    if "error" in result:
+        return JSONResponse({"error": result["error"]}, status_code=400)
+    return result
+
+
+@app.delete("/api/projectnotes/{name}/{note_id}")
+def project_notes_delete(name: str, note_id: int):
+    if not projectmemory._valid_name(name) or not projectmemory.delete_note(name, note_id):
+        return JSONResponse({"error": "No such note."}, status_code=404)
+    return {"ok": True}
+
+
+# ----- knowledge base (your own documents and notes) -----
+@app.get("/api/knowledge")
+def knowledge_overview():
+    return {"documents": knowledge.list_documents(), "stats": knowledge.stats(),
+            "limits": {"max_file_mb": knowledge.MAX_FILE_BYTES // (1024 * 1024), "max_docs": knowledge.MAX_DOCS}}
+
+
+@app.get("/api/knowledge/search")
+def knowledge_try_search(q: str = "", count: int = 5):
+    """Try a search yourself (the same one the agent uses). It costs no model quota."""
+    query = q.strip()[:knowledge.MAX_QUERY_CHARS]
+    if len(query) < 2:
+        return {"results": []}
+    return {"results": knowledge.search(query, max(1, min(count, knowledge.MAX_RESULTS)))}
+
+
+@app.post("/api/knowledge/upload")
+async def knowledge_upload(request: Request):
+    """Add one file (raw bytes in the body, name in the X-Filename header) to the knowledge base."""
+    raw_name = urllib.parse.unquote(request.headers.get("x-filename", "")).strip()
+    if not raw_name:
+        return JSONResponse({"error": "The file has no name."}, status_code=400)
+    data = await read_limited_body(request, knowledge.MAX_FILE_BYTES)
+    if data is None:
+        return JSONResponse({"error": "That file is too big."}, status_code=413)
+    try:
+        doc = await run_in_threadpool(knowledge.add_document, raw_name, data)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except OSError as e:
+        return JSONResponse({"error": f"Could not save it: {e}"}, status_code=500)
+    return doc
+
+
+@app.post("/api/knowledge/text")
+def knowledge_add_text(body: KnowledgeTextIn):
+    """Add a note you typed."""
+    try:
+        return knowledge.add_text(body.title, body.text)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except OSError as e:
+        return JSONResponse({"error": f"Could not save it: {e}"}, status_code=500)
+
+
+@app.post("/api/knowledge/file")
+def knowledge_add_workspace_file(body: KnowledgeFileIn):
+    """Add a file that is already in the workspace (the Files panel button)."""
+    try:
+        target = agent._safe_path(body.path)
+    except ValueError:
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"error": "No such file."}, status_code=404)
+    try:
+        if target.stat().st_size > knowledge.MAX_FILE_BYTES:
+            return JSONResponse({"error": "That file is too big for the knowledge base."}, status_code=400)
+        return knowledge.add_document(target.name, target.read_bytes())
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except OSError as e:
+        return JSONResponse({"error": f"Could not read it: {e}"}, status_code=500)
+
+
+@app.delete("/api/knowledge/{doc_id}")
+def knowledge_delete(doc_id: str):
+    if not knowledge.remove_document(doc_id):
+        return JSONResponse({"error": "No such document."}, status_code=404)
+    return {"ok": True}
 
 
 # ----- projects (Run tab) -----
@@ -1649,6 +1913,11 @@ async def restore(request: Request):
         return JSONResponse({"error": str(e)}, status_code=400)
     except OSError as e:
         return JSONResponse({"error": f"Could not restore: {e}"}, status_code=500)
+    with state.lock:  # the mode, model or notes may have changed: continue the chat from a written summary
+        agent.clear_pending()
+        state.previous_id = None
+        state.chain_model = None
+        state.resume_context = build_context(state.events)
     return {"ok": True, "summary": summary}
 
 
@@ -1933,6 +2202,7 @@ def open_chat(chat_id: str):
         if state.busy:
             return JSONResponse({"error": "Wait for the agent to finish first."}, status_code=409)
         agent.clear_pending()
+        agent.reset_focus()  # project notes load again when a project is named or used
         state.chat_id = chat_id
         state.chat_created = str(data.get("created") or now_iso())
         state.chat_title = str(data.get("custom_title") or "") or None
@@ -2118,7 +2388,8 @@ def main():
     print(f"Agent web interface running at {url}")
     if REQUIRE_LOGIN:
         print("Sign-in is on: the browser will ask for your username and password.")
-        print("The new login works at once and signs everyone out.")
+        print(f"They are APP_USERNAME and APP_PASSWORD in {ENV_FILE}")
+        print("Change them there at any time: the new login works at once and signs everyone out.")
         creds = env_credentials()
         if creds and len(creds["password"]) < 6:
             print("  [warning] your password is shorter than 6 characters. A longer one is safer.")
